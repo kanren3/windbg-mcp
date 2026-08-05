@@ -30,7 +30,22 @@ import {
   createKdSession,
 } from "./session.ts";
 
+/** Discover-era protocol revision (server/discover). */
 const PROTOCOL_VERSION = "2026-07-28";
+/**
+ * Newest revision mainstream SDKs support (@modelcontextprotocol/sdk
+ * SUPPORTED_PROTOCOL_VERSIONS). Used as the initialize fallback so that
+ * clients which predate the discover era can connect.
+ */
+const LATEST_OFFICIAL_VERSION = "2025-11-25";
+const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
+  PROTOCOL_VERSION,
+  LATEST_OFFICIAL_VERSION,
+  "2025-06-18",
+  "2025-03-26",
+  "2024-11-05",
+  "2024-10-07",
+];
 const SERVER_NAME = "windbg-mcp";
 const SERVER_VERSION = "0.1.0";
 
@@ -326,7 +341,7 @@ export class McpServer {
           result = this.handleDiscover();
           break;
         case "initialize":
-          result = this.handleLegacyInitialize();
+          result = this.handleLegacyInitialize(params);
           break;
         case "tools/list":
           result = this.handleToolsList();
@@ -365,7 +380,7 @@ export class McpServer {
   private handleDiscover(): unknown {
     return {
       resultType: "complete",
-      supportedVersions: [PROTOCOL_VERSION],
+      supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
       capabilities: {
         tools: { listChanged: true },
         resources: {},
@@ -382,9 +397,16 @@ export class McpServer {
     };
   }
 
-  private handleLegacyInitialize(): unknown {
+  private handleLegacyInitialize(params: unknown): unknown {
+    // Version negotiation: echo the client's requested version when we
+    // support it (spec: server MUST respond with the same version); fall
+    // back to the newest version mainstream SDKs recognize otherwise.
+    const requested = (params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
+    const negotiated = typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+      ? requested
+      : LATEST_OFFICIAL_VERSION;
     return {
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: negotiated,
       capabilities: {
         tools: { listChanged: true },
         resources: {},
