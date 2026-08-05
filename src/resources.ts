@@ -28,6 +28,12 @@ export function renderGuide(catalog: Catalog): string {
   out += "3. If the target is `running` or `busy`, call `windbg_interrupt_target` to break in, then re-check `windbg_sessions`.\n";
   out += "4. Run commands with `windbg_execute_command`. Read `windbg://command/{id}` for command syntax, `windbg://command-full/{id}` for the full topic.\n";
   out += "5. End a session with `windbg_close` (`q`; a process started by windbg_open_executable is terminated) or `windbg_detach` (`qd`; the debuggee keeps running).\n\n";
+
+  out += "Command reference\n";
+  out += "-----------------\n";
+  out += "Use windbg_search_commands to find exact syntax for any WinDbg/KD command.\n";
+  out += "Read windbg://command/{id} for a compact card or windbg://command-full/{id} for full docs.\n\n";
+
   out += "Key resources\n";
   out += "-------------\n";
   out += `- Guide: ${GUIDE_URI}\n`;

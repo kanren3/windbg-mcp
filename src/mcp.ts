@@ -17,9 +17,10 @@
  * - windbg_sessions         — enumerate sessions with type/target/state
  * - windbg_interrupt_target — CTRL+BREAK into the running target
  * - windbg_execute_command  — run any debugger command
+ * - windbg_search_commands  — search the command catalog by keyword
  */
 
-import { Catalog } from "./catalog.ts";
+import { Catalog, entrySyntaxBlock } from "./catalog.ts";
 import { renderCompactCommand, renderFullCommand, renderGuide, GUIDE_URI } from "./resources.ts";
 import {
   type DebuggerSession,
@@ -32,6 +33,29 @@ import {
 const PROTOCOL_VERSION = "2026-07-28";
 const SERVER_NAME = "windbg-mcp";
 const SERVER_VERSION = "0.1.0";
+
+const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and kd.exe (kernel).
+
+## Choose a tool by task
+- Analyze a crash dump (.dmp/.mdmp) → windbg_open_dump, then windbg_execute_command with "!analyze -v"
+- Debug a running process → windbg_attach_process (by pid or name)
+- Start a new process under the debugger → windbg_open_executable
+- Debug a kernel target (VM, test machine) → windbg_attach_kernel with a connection string
+- Check debugger state → windbg_sessions (look for ready_for_commands=true)
+- Target is running, need prompt → windbg_interrupt_target, then re-check windbg_sessions
+- Run any debugger command → windbg_execute_command
+- Unsure of the exact command → windbg_search_commands with a keyword
+- End session, kill debuggee → windbg_close
+- End session, keep debuggee running → windbg_detach
+
+## After opening a session
+1. Set symbols: windbg_execute_command with ".symfix" then ".reload"
+2. For dumps: windbg_execute_command with "!analyze -v" first
+3. For live targets: windbg_execute_command with "kb" for stack trace
+
+## Resources
+- windbg://guide/overview — full workflow guide
+- windbg://command/{id} — per-command syntax card`;
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -77,7 +101,7 @@ const TOOLS = [
   {
     name: "windbg_open_executable",
     title: "Start and debug an executable",
-    description: "Launch a process under cdb.exe (cdb <exe> [args...]). Returns a session_id. The debuggee runs as a child of cdb; `windbg_close` terminates it, `windbg_detach` lets it keep running.",
+    description: "Launch a process under cdb.exe. Returns a session_id. The debuggee runs as a child of cdb; windbg_close terminates it, windbg_detach lets it keep running.\nAfter opening: set symbols with \".symfix\" + \".reload\", then run \"g\" to start execution or \"bp <symbol>\" to set breakpoints first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -93,7 +117,7 @@ const TOOLS = [
   {
     name: "windbg_open_dump",
     title: "Open a crash dump",
-    description: "Open a crash dump file (.dmp/.mdmp/.hdmp) with cdb -z for analysis. Returns a session_id. A dump is a static target: commands run directly, there is nothing to break into.",
+    description: "Open a crash dump file (.dmp/.mdmp/.hdmp) for analysis. Returns a session_id. A dump is static: commands run immediately, no break-in needed.\nAfter opening: set symbols with \".symfix\" + \".reload\", then run \"!analyze -v\" for automated crash analysis.",
     inputSchema: {
       type: "object",
       properties: {
@@ -108,7 +132,7 @@ const TOOLS = [
   {
     name: "windbg_close",
     title: "Close a debug session",
-    description: "End debugging by executing `q`. For a session created by windbg_open_executable the debuggee process is terminated together with the debugger.",
+    description: "End debugging by executing `q`. For a session created by windbg_open_executable the debuggee is terminated with it. For kernel sessions, sends `g` to resume the target before quitting.",
     inputSchema: {
       type: "object",
       properties: {
@@ -119,7 +143,7 @@ const TOOLS = [
   {
     name: "windbg_attach_process",
     title: "Attach to a running process",
-    description: "Attach cdb.exe to an existing user-mode process by pid (-p) or name (-pn). Returns a session_id. The debugger breaks in at attach; use `windbg_detach` to leave the process running.",
+    description: "Attach cdb.exe to a running user-mode process by pid or name. Returns a session_id. The debugger breaks in at attach.\nAfter attaching: set symbols with \".symfix\" + \".reload\", then use \"kb\" for stack trace or \"dv\" for local variables. Use windbg_detach to leave the process running.",
     inputSchema: {
       type: "object",
       properties: {
@@ -138,7 +162,7 @@ const TOOLS = [
   {
     name: "windbg_attach_kernel",
     title: "Attach to a kernel target",
-    description: "Attach kd.exe to a kernel target with -k. Waits for the target to connect, then breaks in. Returns a session_id. Connection strings: KDNET 'net:port=50000,key=1.2.3.4', named pipe 'com:pipe,port=\\\\.\\pipe\\com_1,baud=115200,reconnect,resets=0', serial 'com:port=COM1,baud=115200'.",
+    description: "Attach kd.exe to a kernel target. Returns a session_id. The target must be booted with debugging enabled.\nConnection strings: KDNET 'net:port=50000,key=1.2.3.4', named pipe 'com:pipe,port=\\\\.\\pipe\\com_1,baud=115200,reconnect,resets=0', serial 'com:port=COM1,baud=115200'.\nAfter connecting: set symbols with \".symfix\" + \".reload\", then use \"kb\" for stack trace or \"!process 0 0\" to list processes.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,7 +177,7 @@ const TOOLS = [
   {
     name: "windbg_detach",
     title: "Detach from a debug session",
-    description: "End debugging by executing `qd` (quit and detach). The debuggee process is NOT terminated and keeps running.",
+    description: "End debugging by executing `qd` (quit and detach). The debuggee process is NOT terminated and keeps running. Use this after attaching to a production process you must not kill.",
     inputSchema: {
       type: "object",
       properties: {
@@ -164,16 +188,45 @@ const TOOLS = [
   {
     name: "windbg_sessions",
     title: "List active debug sessions",
-    description: "Enumerate all live sessions created by windbg_open_* and windbg_attach_*. Each entry includes the session id, creation time, session type, target, and current state (break, running, busy, ...). Use the state to isolate multiple sessions and to decide whether `windbg_execute_command` can be called.",
+    description: "List all active debug sessions. Each entry includes session_id, type (cdb/kd), target, and state. Check state.ready_for_commands before calling windbg_execute_command — if false, call windbg_interrupt_target first.",
     inputSchema: {
       type: "object",
       properties: {},
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        sessions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              session_id: { type: "string", description: "Unique session identifier" },
+              created_at: { type: "string", description: "ISO 8601 creation timestamp" },
+              type: { type: "string", description: "Session type (cdb_executable, cdb_dump, cdb_attach, kd_kernel)" },
+              kind: { type: "string", description: "Debugger kind (cdb or kd)" },
+              target: { type: "string", description: "Target description (path, pid, or connection string)" },
+              state: {
+                type: "object",
+                properties: {
+                  status_name: { type: "string" },
+                  ready_for_commands: { type: "boolean", description: "True if the debugger accepts commands" },
+                  running: { type: "boolean" },
+                  busy: { type: "boolean" },
+                },
+              },
+            },
+            required: ["session_id", "type", "target", "state"],
+          },
+        },
+      },
+      required: ["sessions"],
     },
   },
   {
     name: "windbg_interrupt_target",
     title: "Interrupt the running target",
-    description: "Break into the currently running target by sending CTRL+BREAK to the debugger's process group. Use it when the target is running or busy and you need the prompt back. Query `windbg_sessions` afterwards to confirm the state changed to break.",
+    description: "Break into a running target (like pressing Ctrl+C in the debugger console). Use when the target is running and you need to enter commands. After interrupting, call windbg_sessions to confirm state changed to break.",
     inputSchema: {
       type: "object",
       properties: {
@@ -184,7 +237,7 @@ const TOOLS = [
   {
     name: "windbg_execute_command",
     title: "Execute a debugger command",
-    description: "Execute an arbitrary WinDbg/KD command string on a session. The debugger must be in break state (ready for commands); check `windbg_sessions` first and use `windbg_interrupt_target` if the target is running.",
+    description: "Execute any WinDbg/KD command string. The debugger must be at a prompt (break state) — check windbg_sessions first.\nCommon commands: \"kb\" (stack trace), \"lm\" (loaded modules), \"dt <type>\" (display type), \"dv\" (local variables), \"r\" (registers), \"u <addr>\" (disassemble), \"d <addr>\" (display memory), \"bp <symbol>\" (set breakpoint), \"g\" (continue), \"!analyze -v\" (crash analysis), \".symfix\" + \".reload\" (set symbols).",
     inputSchema: {
       type: "object",
       properties: {
@@ -193,6 +246,50 @@ const TOOLS = [
         timeout: { type: "number", description: "Override the session timeout in seconds" },
       },
       required: ["command"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        output: { type: "string", description: "Raw debugger output text" },
+        state_before: { type: "object" },
+        state_after: { type: "object" },
+      },
+      required: ["command", "output"],
+    },
+  },
+  {
+    name: "windbg_search_commands",
+    title: "Search WinDbg command reference",
+    description: "Search the WinDbg/KD command catalog by keyword. Returns matching commands with syntax, summary, and a resource URI for full documentation. Use when unsure of the exact command name or syntax.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query (e.g. 'breakpoint', 'stack trace', 'dt', '.sympath')" },
+        limit: { type: "number", description: "Max results to return (default 10)" },
+      },
+      required: ["query"],
+    },
+    outputSchema: {
+      type: "object",
+      properties: {
+        results: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              tokens: { type: "array", items: { type: "string" } },
+              summary: { type: "string" },
+              syntax: { type: "string", description: "Command syntax (may be null)" },
+              resource: { type: "string", description: "URI for full documentation" },
+            },
+            required: ["id", "title", "tokens", "summary"],
+          },
+        },
+      },
+      required: ["results"],
     },
   },
 ] as const;
@@ -279,8 +376,7 @@ export class McpServer {
           version: SERVER_VERSION,
         },
       },
-      instructions:
-        "This server drives cdb.exe (user mode) and kd.exe (kernel). Open a session with windbg_open_executable, windbg_open_dump, windbg_attach_process, or windbg_attach_kernel; list sessions and their states with windbg_sessions. When a target is running, break in with windbg_interrupt_target before running commands with windbg_execute_command. End sessions with windbg_close (`q`, debuggee terminated) or windbg_detach (`qd`, debuggee keeps running). Read windbg://command/{id} resources for command syntax.",
+      instructions: SERVER_INSTRUCTIONS,
       ttlMs: 3600000,
       cacheScope: "public",
     };
@@ -294,8 +390,7 @@ export class McpServer {
         resources: {},
       },
       serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-      instructions:
-        "This server drives cdb.exe (user mode) and kd.exe (kernel). Open a session with windbg_open_executable, windbg_open_dump, windbg_attach_process, or windbg_attach_kernel; list sessions and their states with windbg_sessions. When a target is running, break in with windbg_interrupt_target before running commands with windbg_execute_command. End sessions with windbg_close (`q`, debuggee terminated) or windbg_detach (`qd`, debuggee keeps running).",
+      instructions: SERVER_INSTRUCTIONS,
     };
   }
 
@@ -308,6 +403,7 @@ export class McpServer {
         title: t.title,
         description: t.description,
         inputSchema: t.inputSchema,
+        ...("outputSchema" in t ? { outputSchema: t.outputSchema } : {}),
       })),
     };
   }
@@ -338,6 +434,8 @@ export class McpServer {
         return await this.toolInterruptTarget(args);
       case "windbg_execute_command":
         return await this.toolExecuteCommand(args);
+      case "windbg_search_commands":
+        return this.toolSearchCommands(args);
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -480,7 +578,7 @@ export class McpServer {
         state,
       });
     }
-    return toolResult({ sessions: list });
+    return toolResult({ sessions: list }, { sessions: list });
   }
 
   private async toolInterruptTarget(args: Record<string, unknown>): Promise<unknown> {
@@ -500,12 +598,28 @@ export class McpServer {
 
     const timeout = numOrUndefined(args.timeout);
     const result = await rec.session.execute(command, timeout);
-    return toolResult({
+    const payload = {
       command: result.command,
       output: result.output,
       state_before: result.state_before,
       state_after: result.state_after,
-    });
+    };
+    return toolResult(payload, payload);
+  }
+
+  private toolSearchCommands(args: Record<string, unknown>): unknown {
+    const query = typeof args.query === "string" ? args.query : "";
+    if (!query) return toolError("Missing required argument: query");
+    const limit = numOrUndefined(args.limit) ?? 10;
+    const results = this.catalog.search(query, limit).map((entry) => ({
+      id: entry.id,
+      title: entry.title,
+      tokens: entry.tokens,
+      summary: entry.summary,
+      syntax: entrySyntaxBlock(entry),
+      resource: `windbg://command/${entry.id}`,
+    }));
+    return toolResult({ results }, { results });
   }
 
   // -- Resources ----------------------------------------------------------
@@ -606,11 +720,15 @@ function jsonRpcError(id: unknown, code: number, message: string): unknown {
 }
 
 /** Tool result as structured text content (isError=false). */
-function toolResult(data: unknown): unknown {
-  return {
+function toolResult(data: unknown, structured?: unknown): unknown {
+  const result: Record<string, unknown> = {
     content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
     isError: false,
   };
+  if (structured !== undefined) {
+    result.structuredContent = structured;
+  }
+  return result;
 }
 
 /** Tool error as text content (isError=true). */

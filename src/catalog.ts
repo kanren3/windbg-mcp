@@ -160,6 +160,51 @@ export class Catalog {
     return null;
   }
 
+  search(query: string, limit: number): CatalogEntry[] {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return this.entries.slice(0, limit);
+
+    const terms = needle.split(/\s+/).filter(Boolean);
+    const scored: { score: number; matched: number; entry: CatalogEntry }[] = [];
+
+    for (const entry of this.entries) {
+      let score = 0;
+      let matched = 0;
+
+      // Exact id match
+      if (entry.id === needle) score += 1000;
+
+      // Token matches
+      for (const token of entry.tokens) {
+        const tl = token.toLowerCase();
+        if (tl === needle) score += 500;
+        else if (tl.startsWith(needle)) score += 200;
+        else if (tl.includes(needle)) score += 100;
+      }
+
+      // Per-term matches
+      for (const term of terms) {
+        let hit = false;
+        for (const token of entry.tokens) {
+          const tl = token.toLowerCase();
+          if (tl === term) { score += 50; hit = true; }
+          else if (tl.startsWith(term)) { score += 20; hit = true; }
+          else if (tl.includes(term)) { score += 10; hit = true; }
+        }
+        if (entry.title.toLowerCase().includes(term)) { score += 15; hit = true; }
+        if (entry.summary.toLowerCase().includes(term)) { score += 5; hit = true; }
+        if (hit) matched++;
+      }
+
+      if (score > 0) scored.push({ score, matched, entry });
+    }
+
+    scored.sort((a, b) =>
+      b.score - a.score || b.matched - a.matched || a.entry.id.localeCompare(b.entry.id),
+    );
+    return scored.slice(0, limit).map((s) => s.entry);
+  }
+
   renderIndex(): string {
     const commandCount = this.entries.filter((e) => e.section === "command").length;
     const metaCount = this.len() - commandCount;
