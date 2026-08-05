@@ -222,7 +222,9 @@ export class DebuggerSession {
       const resynced = await this.abortRunningCommand();
       const detail = resynced
         ? ""
-        : " The debugger may still be busy. Try windbg_interrupt_target to regain control, then windbg_sessions to check state.";
+        : this.isLiveSession
+          ? " — the debugger may still be busy. Try windbg_interrupt_target to regain control, then windbg_sessions to check state."
+          : " — the command may need more time. Retry this command with a larger timeout.";
       throw new Error(`Command timed out after ${cmdTimeout} seconds: ${command}${detail}`);
     }
 

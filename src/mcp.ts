@@ -188,7 +188,7 @@ const TOOLS = [
   {
     name: "windbg_sessions",
     title: "List active debug sessions",
-    description: "List all active debug sessions. Each entry includes session_id, type (cdb/kd), target, and state. Check state.ready_for_commands before calling windbg_execute_command — if false, call windbg_interrupt_target first.",
+    description: "List all active debug sessions. Each entry includes session_id, type (executable/dump/process/kernel), kind (cdb/kd), target, and state. Check state.ready_for_commands before calling windbg_execute_command — if false, call windbg_interrupt_target first.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -203,7 +203,7 @@ const TOOLS = [
             properties: {
               session_id: { type: "string", description: "Unique session identifier" },
               created_at: { type: "string", description: "ISO 8601 creation timestamp" },
-              type: { type: "string", description: "Session type (cdb_executable, cdb_dump, cdb_attach, kd_kernel)" },
+              type: { type: "string", description: "Session type (executable, dump, process, kernel)" },
               kind: { type: "string", description: "Debugger kind (cdb or kd)" },
               target: { type: "string", description: "Target description (path, pid, or connection string)" },
               state: {
@@ -282,7 +282,7 @@ const TOOLS = [
               title: { type: "string" },
               tokens: { type: "array", items: { type: "string" } },
               summary: { type: "string" },
-              syntax: { type: "string", description: "Command syntax (may be null)" },
+              syntax: { type: ["string", "null"], description: "Command syntax (may be null)" },
               resource: { type: "string", description: "URI for full documentation" },
             },
             required: ["id", "title", "tokens", "summary"],
@@ -608,9 +608,10 @@ export class McpServer {
   }
 
   private toolSearchCommands(args: Record<string, unknown>): unknown {
-    const query = typeof args.query === "string" ? args.query : "";
+    const query = typeof args.query === "string" ? args.query.trim() : "";
     if (!query) return toolError("Missing required argument: query");
     const limit = numOrUndefined(args.limit) ?? 10;
+    if (limit < 1) return toolError("Invalid argument: limit must be >= 1");
     const results = this.catalog.search(query, limit).map((entry) => ({
       id: entry.id,
       title: entry.title,

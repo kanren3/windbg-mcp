@@ -48,6 +48,7 @@ export function renderGuide(catalog: Catalog): string {
   out += "- windbg_sessions\n";
   out += "- windbg_interrupt_target\n";
   out += "- windbg_execute_command\n";
+  out += "- windbg_search_commands\n";
   out += "- windbg_close\n";
   out += "- windbg_detach\n\n";
   out += catalog.renderIndex();

@@ -161,6 +161,7 @@ export class Catalog {
   }
 
   search(query: string, limit: number): CatalogEntry[] {
+    limit = Math.max(0, Math.trunc(limit));
     const needle = query.trim().toLowerCase();
     if (!needle) return this.entries.slice(0, limit);
 
