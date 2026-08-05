@@ -1,11 +1,41 @@
 {
   "name": "windbg-mcp",
   "version": "0.1.0",
+  "description": "MCP server that drives cdb.exe/kd.exe (WinDbg): crash dump analysis, live user-mode debugging, and kernel debugging",
   "type": "module",
+  "bin": {
+    "windbg-mcp": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "bun": ">=1.1.0"
+  },
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run src/index.ts"
   },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "windbg",
+    "cdb",
+    "kd",
+    "debugger",
+    "crash-dump",
+    "kernel-debugging",
+    "windows"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kanren3/windbg-mcp.git"
+  },
+  "homepage": "https://github.com/kanren3/windbg-mcp",
   "dependencies": {},
   "devDependencies": {}
 }
