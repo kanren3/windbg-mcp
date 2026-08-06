@@ -28,7 +28,7 @@ Add to your MCP client configuration:
 | `windbg_attach_process` | Attach to a running process by pid or name |
 | `windbg_attach_kernel` | Connect kd to a kernel target (KDNET / pipe / serial) |
 | `windbg_execute_command` | Run any debugger command (`kb`, `lm`, `!analyze -v`, …) |
-| `windbg_sessions` | List sessions with state (`ready_for_commands`) |
+| `windbg_sessions` | List active sessions with their state |
 | `windbg_interrupt_target` | Break into a running target (CTRL+BREAK) |
 | `windbg_search_commands` | Search the WinDbg command catalog by keyword |
 | `windbg_close` | End session, terminating the debuggee |
