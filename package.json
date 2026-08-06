@@ -1,6 +1,6 @@
 {
   "name": "windbg-mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server that drives cdb.exe/kd.exe (WinDbg): crash dump analysis, live user-mode debugging, and kernel debugging",
   "type": "module",
   "bin": {
