@@ -41,3 +41,8 @@ git clone https://github.com/kanren3/windbg-mcp.git
 cd windbg-mcp
 bun run src/index.ts
 ```
+
+## References
+
+- [Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — agent design patterns that motivate the tool/agent boundaries here
+- [Model Context Protocol](https://modelcontextprotocol.io) — the protocol this server implements
