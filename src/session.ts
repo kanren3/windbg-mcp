@@ -440,12 +440,59 @@ const DEFAULT_KD_PATHS = [
   "C:\\Program Files\\Debugging Tools for Windows (x86)\\kd.exe",
 ];
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, type Dirent } from "node:fs";
+import { join } from "node:path";
 
-function findExecutable(paths: string[], customPath?: string): string {
+// ---------------------------------------------------------------------------
+// WinDbg for Windows (Store/MSIX) auto-detection
+// ---------------------------------------------------------------------------
+// The classic Windows Kits paths above cover the standalone Debugging Tools
+// installer. The current WinDbg ships as a Store package that lands in
+// %ProgramFiles%\WindowsApps\Microsoft.WinDbg_<version>_<arch>__8wekyb3d8bbwe
+// with the classic debugger binaries under amd64\ (or arm64\).
+// Detection order: classic paths → enumerate the WindowsApps folder. If the
+// folder is not enumerable or the package lives on a non-standard volume, the
+// error from findExecutable points at the cdb_path / kd_path escape hatch.
+
+const WINDOWS_APPS_PACKAGE_PREFIX = "Microsoft.WinDbg_";
+const WINDBG_ARCH_DIRS = process.arch === "arm64" ? ["arm64", "amd64"] : ["amd64", "arm64"];
+
+function windowsAppsRoot(): string {
+  return join(process.env.ProgramFiles ?? "C:\\Program Files", "WindowsApps");
+}
+
+/** Locate cdb/kd by enumerating %ProgramFiles%\WindowsApps\Microsoft.WinDbg_*. */
+export function findWindowsAppsByGlob(exeName: "cdb.exe" | "kd.exe"): string | undefined {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(windowsAppsRoot(), { withFileTypes: true });
+  } catch {
+    return undefined; // Folder missing or not enumerable — findExecutable's error offers cdb_path / kd_path.
+  }
+  // Newest package first: Store version tokens are fixed-width, so descending
+  // name order ≈ descending version order when several versions coexist.
+  entries.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(WINDOWS_APPS_PACKAGE_PREFIX)) continue;
+    for (const arch of WINDBG_ARCH_DIRS) {
+      const candidate = join(windowsAppsRoot(), entry.name, arch, exeName);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function findExecutable(customPath: string | undefined, exeName: "cdb.exe" | "kd.exe"): string {
   if (customPath && existsSync(customPath)) return customPath;
-  for (const p of paths) if (existsSync(p)) return p;
-  throw new Error("Could not find debugger executable. Please provide a valid path.");
+  const classicPaths = exeName === "cdb.exe" ? DEFAULT_CDB_PATHS : DEFAULT_KD_PATHS;
+  for (const p of classicPaths) if (existsSync(p)) return p;
+  // Like the classic paths, the Store package is probed on every call, so a
+  // WinDbg installed after server start is picked up without a restart.
+  const fromStore = findWindowsAppsByGlob(exeName);
+  if (fromStore) return fromStore;
+  throw new Error(
+    `Could not find ${exeName}. Install WinDbg (Microsoft Store) or Debugging Tools for Windows, or pass an explicit path (cdb_path / kd_path).`,
+  );
 }
 
 export function createCdbExecutableSession(
@@ -453,7 +500,7 @@ export function createCdbExecutableSession(
   execArgs: string[],
   opts?: { cdbPath?: string; symbolsPath?: string; timeout?: number },
 ): DebuggerSession {
-  const cdbPath = findExecutable(DEFAULT_CDB_PATHS, opts?.cdbPath);
+  const cdbPath = findExecutable(opts?.cdbPath, "cdb.exe");
   // cdb parses options before the first non-option token (the debuggee command
   // line), so -y MUST precede the executable; otherwise it is passed to the
   // debuggee as its own argument.
@@ -476,7 +523,7 @@ export function createCdbDumpSession(
   dumpPath: string,
   opts?: { cdbPath?: string; symbolsPath?: string; timeout?: number },
 ): DebuggerSession {
-  const cdbPath = findExecutable(DEFAULT_CDB_PATHS, opts?.cdbPath);
+  const cdbPath = findExecutable(opts?.cdbPath, "cdb.exe");
   const args = [cdbPath, "-z", dumpPath];
   if (opts?.symbolsPath) args.push("-y", opts.symbolsPath);
   return new DebuggerSession("cdb", {
@@ -492,7 +539,7 @@ export function createCdbAttachSession(
   attachSpec: string,
   opts?: { cdbPath?: string; symbolsPath?: string; timeout?: number },
 ): DebuggerSession {
-  const cdbPath = findExecutable(DEFAULT_CDB_PATHS, opts?.cdbPath);
+  const cdbPath = findExecutable(opts?.cdbPath, "cdb.exe");
   // attachSpec is either a decimal pid (-p) or a process name (-pn)
   const flag = /^\d+$/.test(attachSpec) ? "-p" : "-pn";
   const args = [cdbPath, flag, attachSpec];
@@ -510,7 +557,7 @@ export function createKdSession(
   kernelConnection: string,
   opts?: { kdPath?: string; symbolsPath?: string; timeout?: number },
 ): DebuggerSession {
-  const kdPath = findExecutable(DEFAULT_KD_PATHS, opts?.kdPath);
+  const kdPath = findExecutable(opts?.kdPath, "kd.exe");
   const args = [kdPath, "-k", kernelConnection];
   if (opts?.symbolsPath) args.push("-y", opts.symbolsPath);
   return new DebuggerSession("kd", {

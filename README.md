@@ -2,7 +2,7 @@
 
 MCP server that drives **cdb.exe** (user mode) and **kd.exe** (kernel mode) as subprocesses, exposing WinDbg debugging to LLM agents over the Model Context Protocol: crash dump analysis, live process debugging, and kernel debugging.
 
-> Windows only. Requires [Bun](https://bun.sh) ≥ 1.1 (uses `bun:ffi`) and the [Windows Debugging Tools](https://learn.microsoft.com/windows-hardware/drivers/debugger/) (`cdb.exe` / `kd.exe`, auto-detected from the standard Windows Kits paths).
+> Windows only. Requires [Bun](https://bun.sh) ≥ 1.1 (uses `bun:ffi`) and the [Windows Debugging Tools](https://learn.microsoft.com/windows-hardware/drivers/debugger/) (`cdb.exe` / `kd.exe`, auto-detected from the standard Windows Kits paths or the Store-installed WinDbg for Windows).
 
 ## Usage
 
