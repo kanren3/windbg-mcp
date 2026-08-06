@@ -12,8 +12,8 @@ Add to your MCP client configuration:
 {
   "mcpServers": {
     "windbg-mcp": {
-      "command": "bunx",
-      "args": ["windbg-mcp"]
+      "command": "bun",
+      "args": ["x", "windbg-mcp"]
     }
   }
 }
