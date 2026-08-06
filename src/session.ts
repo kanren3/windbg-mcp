@@ -440,56 +440,48 @@ const DEFAULT_KD_PATHS = [
   "C:\\Program Files\\Debugging Tools for Windows (x86)\\kd.exe",
 ];
 
-import { existsSync, readdirSync, type Dirent } from "node:fs";
+import { lstatSync } from "node:fs";
 import { join } from "node:path";
+
+// existsSync/stat follows reparse points and fails on Store execution-alias
+// targets (ACL-blocked package dir); lstat inspects the link itself and works
+// for real files and aliases alike.
+function pathExists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // WinDbg for Windows (Store/MSIX) auto-detection
 // ---------------------------------------------------------------------------
-// The classic Windows Kits paths above cover the standalone Debugging Tools
-// installer. The current WinDbg ships as a Store package that lands in
-// %ProgramFiles%\WindowsApps\Microsoft.WinDbg_<version>_<arch>__8wekyb3d8bbwe
-// with the classic debugger binaries under amd64\ (or arm64\).
-// Detection order: classic paths → enumerate the WindowsApps folder. If the
-// folder is not enumerable or the package lives on a non-standard volume, the
-// error from findExecutable points at the cdb_path / kd_path escape hatch.
+// The Store package's binaries under %ProgramFiles%\WindowsApps are
+// ACL-blocked for direct launch, but Microsoft registers per-user App
+// Execution Aliases under %LOCALAPPDATA%\Microsoft\WindowsApps (cdbX64.exe,
+// kdX64.exe, ...) that launch through the Store activation layer as a normal
+// user. Probe those fixed paths, same as the classic paths, on every call.
 
-const WINDOWS_APPS_PACKAGE_PREFIX = "Microsoft.WinDbg_";
-const WINDBG_ARCH_DIRS = process.arch === "arm64" ? ["arm64", "amd64"] : ["amd64", "arm64"];
-
-function windowsAppsRoot(): string {
-  return join(process.env.ProgramFiles ?? "C:\\Program Files", "WindowsApps");
-}
-
-/** Locate cdb/kd by enumerating %ProgramFiles%\WindowsApps\Microsoft.WinDbg_*. */
-export function findWindowsAppsByGlob(exeName: "cdb.exe" | "kd.exe"): string | undefined {
-  let entries: Dirent[];
-  try {
-    entries = readdirSync(windowsAppsRoot(), { withFileTypes: true });
-  } catch {
-    return undefined; // Folder missing or not enumerable — findExecutable's error offers cdb_path / kd_path.
-  }
-  // Newest package first: Store version tokens are fixed-width, so descending
-  // name order ≈ descending version order when several versions coexist.
-  entries.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(WINDOWS_APPS_PACKAGE_PREFIX)) continue;
-    for (const arch of WINDBG_ARCH_DIRS) {
-      const candidate = join(windowsAppsRoot(), entry.name, arch, exeName);
-      if (existsSync(candidate)) return candidate;
-    }
-  }
-  return undefined;
+function storeAliasCandidates(exeName: "cdb.exe" | "kd.exe"): string[] {
+  const stem = exeName === "cdb.exe" ? "cdb" : "kd";
+  const names = process.arch === "arm64"
+    ? [`${stem}ARM64.exe`, `${stem}X64.exe`]
+    : [`${stem}X64.exe`, `${stem}X86.exe`];
+  const localAppData = process.env.LOCALAPPDATA
+    ?? join(process.env.USERPROFILE ?? "C:\\Users\\Default", "AppData", "Local");
+  return names.map((n) => join(localAppData, "Microsoft", "WindowsApps", n));
 }
 
 function findExecutable(customPath: string | undefined, exeName: "cdb.exe" | "kd.exe"): string {
-  if (customPath && existsSync(customPath)) return customPath;
+  if (customPath && pathExists(customPath)) return customPath;
+  // Priority: explicit path → Store aliases → Windows Kits → legacy Debugging
+  // Tools. Everything is probed on every call, so a WinDbg installed after
+  // server start is picked up without a restart.
+  for (const p of storeAliasCandidates(exeName)) if (pathExists(p)) return p;
   const classicPaths = exeName === "cdb.exe" ? DEFAULT_CDB_PATHS : DEFAULT_KD_PATHS;
-  for (const p of classicPaths) if (existsSync(p)) return p;
-  // Like the classic paths, the Store package is probed on every call, so a
-  // WinDbg installed after server start is picked up without a restart.
-  const fromStore = findWindowsAppsByGlob(exeName);
-  if (fromStore) return fromStore;
+  for (const p of classicPaths) if (pathExists(p)) return p;
   throw new Error(
     `Could not find ${exeName}. Install WinDbg (Microsoft Store) or Debugging Tools for Windows, or pass an explicit path (cdb_path / kd_path).`,
   );
