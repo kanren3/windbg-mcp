@@ -13,7 +13,7 @@ Add to your MCP client configuration:
   "mcpServers": {
     "windbg-mcp": {
       "command": "bun",
-      "args": ["x", "windbg-mcp"]
+      "args": ["x", "windbg-mcp@latest"]
     }
   }
 }
