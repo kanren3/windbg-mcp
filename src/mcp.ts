@@ -47,7 +47,7 @@ const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
   "2024-10-07",
 ];
 const SERVER_NAME = "windbg-mcp";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "0.2.0";
 
 const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and kd.exe (kernel).
 
