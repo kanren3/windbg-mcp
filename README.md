@@ -2,11 +2,24 @@
 
 MCP server that drives **cdb.exe** (user mode) and **kd.exe** (kernel mode) as subprocesses, exposing WinDbg debugging to LLM agents over the Model Context Protocol: crash dump analysis, live process debugging, and kernel debugging.
 
-> Windows only. Requires [Bun](https://bun.sh) ≥ 1.1 (uses `bun:ffi`) and the [Windows Debugging Tools](https://learn.microsoft.com/windows-hardware/drivers/debugger/) (`cdb.exe` / `kd.exe`, auto-detected from the standard Windows Kits paths or the Store-installed WinDbg for Windows).
+> Windows only. Requires [Node.js](https://nodejs.org) ≥ 22 (uses `koffi`) or [Bun](https://bun.sh) (uses `bun:ffi`), plus the [Windows Debugging Tools](https://learn.microsoft.com/windows-hardware/drivers/debugger/) (`cdb.exe` / `kd.exe`, auto-detected from the standard Windows Kits paths or the Store-installed WinDbg for Windows).
 
 ## Usage
 
-Add to your MCP client configuration:
+Add to your MCP client configuration (Node):
+
+```json
+{
+  "mcpServers": {
+    "windbg-mcp": {
+      "command": "npx",
+      "args": ["-y", "windbg-mcp@latest"]
+    }
+  }
+}
+```
+
+Or with Bun:
 
 ```json
 {
@@ -31,16 +44,8 @@ Add to your MCP client configuration:
 | `windbg_sessions` | List active sessions with their state |
 | `windbg_interrupt_target` | Break into a running target (CTRL+BREAK) |
 | `windbg_search_commands` | Search the WinDbg command catalog by keyword |
-| `windbg_close` | End session, terminating the debuggee |
-| `windbg_detach` | End session, leaving the debuggee running |
-
-## Development
-
-```sh
-git clone https://github.com/kanren3/windbg-mcp.git
-cd windbg-mcp
-bun run src/index.ts
-```
+| `windbg_close` | End session with `q` — closes the user-mode target (a kernel target stays locked) |
+| `windbg_detach` | End session with `qd` — detaches and leaves a live user-mode or kernel target running |
 
 ## References
 
