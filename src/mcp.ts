@@ -177,7 +177,7 @@ const TOOLS = [
   {
     name: "windbg_attach_kernel",
     title: "Attach to a kernel target",
-    description: "Attach kd.exe to a kernel target. Returns a session_id. The target must be booted with debugging enabled.\nConnection strings: KDNET 'net:port=50000,key=1.2.3.4', named pipe 'com:pipe,port=\\\\.\\pipe\\com_1,baud=115200,reconnect,resets=0', serial 'com:port=COM1,baud=115200'.\nAfter connecting: set symbols with \".symfix\" + \".reload\", then use \"kb\" for stack trace or \"!process 0 0\" to list processes.",
+    description: "Attach kd.exe to a kernel target. Returns a session_id. The target must be booted with debugging enabled.\nConnection strings: KDNET 'net:port=50000,key=1.2.3.4' (port is optional and defaults to 50000), named pipe 'com:pipe,port=\\\\.\\pipe\\com_1,baud=115200,reconnect,resets=0', serial 'com:port=COM1,baud=115200'.\nAfter connecting: set symbols with \".symfix\" + \".reload\", then use \"kb\" for stack trace or \"!process 0 0\" to list processes.",
     inputSchema: {
       type: "object",
       properties: {

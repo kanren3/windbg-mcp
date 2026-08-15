@@ -547,19 +547,31 @@ export function createCdbAttachSession(
   });
 }
 
+/**
+ * KDNET connection strings may omit `port=`; kd.exe then cannot determine
+ * which port to use and the connection fails. Default it to 50000.
+ */
+function normalizeKdConnection(connection: string): string {
+  if (connection.startsWith("net:") && !connection.includes("port=")) {
+    return connection.replace(/^net:/, "net:port=50000,");
+  }
+  return connection;
+}
+
 export function createKdSession(
   kernelConnection: string,
   opts?: { kdPath?: string; symbolsPath?: string; timeout?: number },
 ): DebuggerSession {
   const kdPath = findExecutable(opts?.kdPath, "kd.exe");
-  const args = [kdPath, "-k", kernelConnection];
+  const connection = normalizeKdConnection(kernelConnection);
+  const args = [kdPath, "-k", connection];
   if (opts?.symbolsPath) args.push("-y", opts.symbolsPath);
   return new DebuggerSession("kd", {
     debuggerPath: kdPath,
     launchArgs: args,
     timeout: opts?.timeout ?? 60,
     isLiveSession: true,
-    target: kernelConnection,
+    target: connection,
   });
 }
 
