@@ -1,13 +1,12 @@
 /**
  * Command catalog — types, loading, search, and URI resolution.
  *
- * Mirrors the catalog design from windbg-mcp-rs: entries are extracted from the
- * debugger.chm documentation, each with an id, section, title, summary, tokens,
- * syntax blocks, and full documentation. Resources are addressed by
- * `windbg://command/{id}` (compact) and `windbg://command-full/{id}` (full).
+ * Entries are extracted from the debugger.chm documentation, each with an id,
+ * section, title, summary, tokens, and full documentation. Command pages are
+ * addressed by `windbg://command/{id}`.
  */
 
-import catalogData from "./data/catalog.json";
+import { readFileSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -16,8 +15,6 @@ import catalogData from "./data/catalog.json";
 export type CatalogSection = "command" | "meta_command";
 
 export type ToolRouting = "execute_command" | "interrupt_target" | "documentation_only";
-
-export type CatalogResourceKind = "compact" | "full";
 
 export interface CatalogEntry {
   id: string;
@@ -36,66 +33,11 @@ export interface CatalogEntry {
 // ---------------------------------------------------------------------------
 
 export const RESOURCE_SCHEME = "windbg://command/";
-export const FULL_RESOURCE_SCHEME = "windbg://command-full/";
 export const TEMPLATE_URI = "windbg://command/{id}";
-export const FULL_TEMPLATE_URI = "windbg://command-full/{id}";
 
 // ---------------------------------------------------------------------------
 // Entry helpers
 // ---------------------------------------------------------------------------
-
-export function entryFullResourceUri(entry: CatalogEntry): string {
-  return `${FULL_RESOURCE_SCHEME}${entry.id}`;
-}
-
-/** Structured syntax from explicit user/kernel fields, falling back to inference. */
-export function entrySyntaxBlock(entry: CatalogEntry): string | null {
-  return formatStructuredSyntax(entry.user_mode_syntax, entry.kernel_mode_syntax)
-    ?? inferSyntaxBlock(entry.documentation);
-}
-
-function formatStructuredSyntax(userMode: string | null, kernelMode: string | null): string | null {
-  const um = cleanedBlock(userMode);
-  const km = cleanedBlock(kernelMode);
-  if (!um && !km) return null;
-
-  let out = "";
-  if (um) { out += "User-Mode Syntax\n"; out += um; }
-  if (km) {
-    if (out) out += "\n\n";
-    out += "Kernel-Mode Syntax\n";
-    out += km;
-  }
-  return out;
-}
-
-function cleanedBlock(block: string | null): string | null {
-  if (!block) return null;
-  const trimmed = block.trim();
-  return trimmed || null;
-}
-
-function inferSyntaxBlock(documentation: string): string | null {
-  const lines = documentation.split("\n");
-  if (lines.length === 0) return null;
-
-  let i = 0;
-  // Skip leading blank lines
-  while (i < lines.length && lines[i].trim() === "") i++;
-  // Skip title (first non-blank block)
-  while (i < lines.length && lines[i].trim() !== "") i++;
-  // Skip blank separator
-  while (i < lines.length && lines[i].trim() === "") i++;
-  // Skip summary (second non-blank block)
-  while (i < lines.length && lines[i].trim() !== "") i++;
-  // Skip blank separator
-  while (i < lines.length && lines[i].trim() === "") i++;
-  // The third non-blank block is the syntax
-  const start = i;
-  while (i < lines.length && lines[i].trim() !== "") i++;
-  if (start >= i) return null;
-  return lines.slice(start, i).join("\n").trim() || null;
-}
 
 export function entryToolRouting(entry: CatalogEntry): ToolRouting {
   if (entry.supports_text_execution) return "execute_command";
@@ -131,9 +73,11 @@ export class Catalog {
 
   static load(): Catalog {
     if (Catalog.instance) return Catalog.instance;
-    const raw = catalogData as CatalogEntry[];
+    const raw = JSON.parse(
+      readFileSync(new URL("./data/catalog.json", import.meta.url), "utf-8"),
+    ) as CatalogEntry[];
     // Validate section values
-    const entries = raw.map((e) => ({
+    const entries = raw.map((e): CatalogEntry => ({
       ...e,
       section: e.section === "meta_command" ? "meta_command" : "command",
     }));
@@ -148,14 +92,9 @@ export class Catalog {
     return idx !== undefined ? this.entries[idx] : null;
   }
 
-  resolveResourceUri(uri: string): { kind: CatalogResourceKind; entry: CatalogEntry } | null {
+  resolveResourceUri(uri: string): CatalogEntry | null {
     if (uri.startsWith(RESOURCE_SCHEME)) {
-      const entry = this.getById(uri.slice(RESOURCE_SCHEME.length));
-      return entry ? { kind: "compact", entry } : null;
-    }
-    if (uri.startsWith(FULL_RESOURCE_SCHEME)) {
-      const entry = this.getById(uri.slice(FULL_RESOURCE_SCHEME.length));
-      return entry ? { kind: "full", entry } : null;
+      return this.getById(uri.slice(RESOURCE_SCHEME.length));
     }
     return null;
   }
@@ -213,17 +152,15 @@ export class Catalog {
     let out = "";
     out += "WinDbg MCP guide\n\n";
     out += "Recommended flow:\n";
-    out += "1. Read `windbg://command/{id}` for the best match; it is optimized for low context.\n";
-    out += "2. Read `windbg://command-full/{id}` only when the compact card is insufficient.\n";
-    out += "3. Call `windbg_sessions` to check the debugger state before execution.\n";
-    out += "4. If the debugger is running or busy, call `windbg_interrupt_target` and then verify state again.\n";
-    out += "5. Call `windbg_execute_command` only when the debugger is ready for commands.\n\n";
+    out += "1. Find a command with `windbg_search_commands`, then read `windbg://command/{id}` for its full documentation.\n";
+    out += "2. Call `windbg_sessions` to check the debugger state before execution.\n";
+    out += "3. If the debugger is running or busy, call `windbg_interrupt_target` and then verify state again.\n";
+    out += "4. Call `windbg_execute_command` only when the debugger is ready for commands.\n\n";
     out += `Total entries: ${this.len()}\n`;
     out += `Commands: ${commandCount}\n`;
     out += `Meta-commands: ${metaCount}\n`;
     out += "Session state tool: windbg_sessions\n";
-    out += `Compact template: ${TEMPLATE_URI}\n`;
-    out += `Full template: ${FULL_TEMPLATE_URI}\n\n`;
+    out += `Command page template: ${TEMPLATE_URI}\n\n`;
     return out;
   }
 }

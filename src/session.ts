@@ -17,7 +17,11 @@
  *   from the text protocol.
  */
 
-import { spawnWin32, type Win32Process } from "./spawn_win32.ts";
+import { spawnWin32, type Win32Process } from "./spawn_win32.js";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -243,40 +247,38 @@ export class DebuggerSession {
     this.process.sendCtrlBreak();
 
     // Wait briefly for the break to take effect
-    await Bun.sleep(500);
+    await sleep(500);
     return await this.queryState();
   }
 
   /**
-   * Close the session with `q`: debugging ends and, for a process cdb
-   * created (open_executable), the debuggee is terminated with it.
+   * Close the session with `q`: debugging ends. In user mode, `q` closes the
+   * target application (launched or attached); in kernel mode it ends the
+   * session and leaves the target locked. The debugger process is killed
+   * afterward as a fallback for cases where `q` does not fully exit.
    */
   async close(): Promise<void> {
     this._stopReader();
     try {
-      // Kernel targets left halted freeze the machine; resume before quitting.
-      if (this.kind === "kd") {
-        this.writeStdin("g\n");
-        await Bun.sleep(300);
-      }
       this.writeStdin("q\n");
     } catch { /* process may already be gone */ }
 
-    await Bun.sleep(300);
+    await sleep(300);
     try { this.process.kill(); } catch { /* already exited */ }
   }
 
   /**
-   * Detach with `qd`: debugging ends but the debuggee keeps running.
-   * User-mode only; kernel sessions fall back to plain `q`.
+   * Detach with `qd`: debugging ends and the target resumes running. Applies
+   * to live user-mode and kernel-mode targets; `q` would instead leave a
+   * kernel target locked.
    */
   async detach(): Promise<void> {
     this._stopReader();
     try {
-      this.writeStdin(this.kind === "cdb" ? "qd\n" : "q\n");
+      this.writeStdin("qd\n");
     } catch { /* process may already be gone */ }
 
-    await Bun.sleep(300);
+    await sleep(300);
     try { this.process.kill(); } catch { /* already exited */ }
   }
 
@@ -358,7 +360,7 @@ export class DebuggerSession {
         this._expectedMarker = null;
         return true;
       }
-      await Bun.sleep(50);
+      await sleep(50);
     }
     this._expectedMarker = null;
     return false;

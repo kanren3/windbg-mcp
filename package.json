@@ -4,20 +4,22 @@
   "description": "MCP server that drives cdb.exe/kd.exe (WinDbg): crash dump analysis, live user-mode debugging, and kernel debugging",
   "type": "module",
   "bin": {
-    "windbg-mcp": "./src/index.ts"
+    "windbg-mcp": "./dist/index.js"
   },
   "files": [
-    "src"
+    "dist"
   ],
   "os": [
     "win32"
   ],
   "engines": {
-    "bun": ">=1.1.0"
+    "node": ">=22"
   },
   "scripts": {
-    "start": "bun run src/index.ts",
-    "dev": "bun run src/index.ts"
+    "build": "tsc && node scripts/build.mjs",
+    "start": "node dist/index.js",
+    "dev": "npm run build && node dist/index.js",
+    "prepack": "npm run build"
   },
   "keywords": [
     "mcp",
@@ -36,6 +38,12 @@
     "url": "git+https://github.com/kanren3/windbg-mcp.git"
   },
   "homepage": "https://github.com/kanren3/windbg-mcp",
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "koffi": "^2.16.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0",
+    "@types/bun": "^1.2.0"
+  }
 }

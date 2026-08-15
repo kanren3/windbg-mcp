@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * windbg-mcp — stdio MCP server entry point.
  *
@@ -12,15 +12,13 @@
  * On exit, closes all debug sessions so no kd/cdb child processes are leaked.
  */
 
-import { McpServer, closeAllSessions, killAllSessionsSync } from "./mcp.ts";
+import { McpServer, closeAllSessions, killAllSessionsSync } from "./mcp.js";
 
 async function main(): Promise<void> {
   const server = new McpServer();
   const stdin = process.stdin;
   const stdout = process.stdout;
 
-  // Don't let stdout buffer — MCP messages must be line-delimited.
-  stdout.setDefaultEncoding("utf-8");
 
   let buffer = "";
   // Serialize dispatches: each request waits for the previous one to settle.

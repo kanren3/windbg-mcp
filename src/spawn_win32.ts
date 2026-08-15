@@ -8,7 +8,7 @@
  *
  * This module replicates that exact behavior via CreateProcessW FFI.
  */
-import { dlopen, FFIType, ptr } from "bun:ffi";
+import { kernel32Ffi } from "./ffi.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -16,67 +16,6 @@ import { dlopen, FFIType, ptr } from "bun:ffi";
 const CREATE_NEW_PROCESS_GROUP = 0x00000200;
 const STARTF_USESTDHANDLES = 0x00000100;
 const HANDLE_FLAG_INHERIT = 0x00000001;
-
-// ---------------------------------------------------------------------------
-// FFI bindings
-// ---------------------------------------------------------------------------
-const kernel32 = dlopen("kernel32.dll", {
-  CreatePipe: {
-    args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32],
-    returns: FFIType.bool,
-  },
-  SetHandleInformation: {
-    args: [FFIType.u64, FFIType.u32, FFIType.u32],
-    returns: FFIType.bool,
-  },
-  CreateProcessW: {
-    args: [
-      FFIType.ptr,   // lpApplicationName
-      FFIType.ptr,   // lpCommandLine
-      FFIType.ptr,   // lpProcessAttributes
-      FFIType.ptr,   // lpThreadAttributes
-      FFIType.bool,  // bInheritHandles
-      FFIType.u32,   // dwCreationFlags
-      FFIType.ptr,   // lpEnvironment
-      FFIType.ptr,   // lpCurrentDirectory
-      FFIType.ptr,   // lpStartupInfo
-      FFIType.ptr,   // lpProcessInformation
-    ],
-    returns: FFIType.bool,
-  },
-  CloseHandle: {
-    args: [FFIType.u64],
-    returns: FFIType.bool,
-  },
-  ReadFile: {
-    args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr],
-    returns: FFIType.bool,
-  },
-  WriteFile: {
-    args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr],
-    returns: FFIType.bool,
-  },
-  GetLastError: {
-    args: [],
-    returns: FFIType.u32,
-  },
-  GenerateConsoleCtrlEvent: {
-    args: [FFIType.u32, FFIType.u32],
-    returns: FFIType.bool,
-  },
-  TerminateProcess: {
-    args: [FFIType.u64, FFIType.u32],
-    returns: FFIType.bool,
-  },
-  WaitForSingleObject: {
-    args: [FFIType.u64, FFIType.u32],
-    returns: FFIType.u32,
-  },
-  PeekNamedPipe: {
-    args: [FFIType.u64, FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr, FFIType.ptr],
-    returns: FFIType.bool,
-  },
-});
 
 // ---------------------------------------------------------------------------
 // Struct sizes (x64)
@@ -144,7 +83,7 @@ export interface Win32Process {
  * Spawn a process with CREATE_NEW_PROCESS_GROUP (keeping console) and piped stdio.
  */
 export function spawnWin32(commandLine: string): Win32Process {
-  const k32 = kernel32.symbols;
+  const ffi = kernel32Ffi;
 
   // --- Create pipes ---
   // stdin: parent writes to writeStdin, child reads from readStdin
@@ -159,18 +98,18 @@ export function spawnWin32(commandLine: string): Win32Process {
   // stdin pipe
   const stdinRead = new ArrayBuffer(8);
   const stdinWrite = new ArrayBuffer(8);
-  if (!k32.CreatePipe(ptr(stdinRead), ptr(stdinWrite), ptr(sa), 0)) {
-    throw new Error(`CreatePipe(stdin) failed: ${k32.GetLastError()}`);
+  if (!ffi.createPipe(stdinRead, stdinWrite, sa, 0)) {
+    throw new Error(`CreatePipe(stdin) failed: ${ffi.getLastError()}`);
   }
 
   // stdout pipe
   const stdoutRead = new ArrayBuffer(8);
   const stdoutWrite = new ArrayBuffer(8);
-  if (!k32.CreatePipe(ptr(stdoutRead), ptr(stdoutWrite), ptr(sa), 0)) {
+  if (!ffi.createPipe(stdoutRead, stdoutWrite, sa, 0)) {
     // Don't leak stdin pipe on failure
-    k32.CloseHandle(readHandle(stdinRead, 0));
-    k32.CloseHandle(readHandle(stdinWrite, 0));
-    throw new Error(`CreatePipe(stdout) failed: ${k32.GetLastError()}`);
+    ffi.closeHandle(readHandle(stdinRead, 0));
+    ffi.closeHandle(readHandle(stdinWrite, 0));
+    throw new Error(`CreatePipe(stdout) failed: ${ffi.getLastError()}`);
   }
 
   // stderr merges into stdout (like Python subprocess.STDOUT).
@@ -179,13 +118,13 @@ export function spawnWin32(commandLine: string): Win32Process {
 
   // Prevent parent-side handles from being inherited into the child.
   // If these fail, the pipe ends leak into this and future children.
-  if (!k32.SetHandleInformation(readHandle(stdinWrite, 0), HANDLE_FLAG_INHERIT, 0) ||
-      !k32.SetHandleInformation(readHandle(stdoutRead, 0), HANDLE_FLAG_INHERIT, 0)) {
-    k32.CloseHandle(readHandle(stdinRead, 0));
-    k32.CloseHandle(readHandle(stdinWrite, 0));
-    k32.CloseHandle(readHandle(stdoutRead, 0));
-    k32.CloseHandle(readHandle(stdoutWrite, 0));
-    throw new Error(`SetHandleInformation failed: ${k32.GetLastError()}`);
+  if (!ffi.setHandleInformation(readHandle(stdinWrite, 0), HANDLE_FLAG_INHERIT, 0) ||
+      !ffi.setHandleInformation(readHandle(stdoutRead, 0), HANDLE_FLAG_INHERIT, 0)) {
+    ffi.closeHandle(readHandle(stdinRead, 0));
+    ffi.closeHandle(readHandle(stdinWrite, 0));
+    ffi.closeHandle(readHandle(stdoutRead, 0));
+    ffi.closeHandle(readHandle(stdoutWrite, 0));
+    throw new Error(`SetHandleInformation failed: ${ffi.getLastError()}`);
   }
 
   // --- STARTUPINFOW ---
@@ -203,28 +142,28 @@ export function spawnWin32(commandLine: string): Win32Process {
   const cmdBuf = toWideString(commandLine);
 
   // --- CreateProcess ---
-  const ok = k32.CreateProcessW(
-    null,            // lpApplicationName — use command line
-    ptr(cmdBuf.buffer), // lpCommandLine
-    null,            // lpProcessAttributes
-    null,            // lpThreadAttributes
-    true,            // bInheritHandles
+  const ok = ffi.createProcessW(
+    null,               // lpApplicationName — use command line
+    cmdBuf.buffer as ArrayBuffer, // lpCommandLine
+    null,               // lpProcessAttributes
+    null,               // lpThreadAttributes
+    true,               // bInheritHandles
     CREATE_NEW_PROCESS_GROUP,
-    null,            // lpEnvironment (inherit)
-    null,            // lpCurrentDirectory (inherit)
-    ptr(si),         // lpStartupInfo
-    ptr(pi),         // lpProcessInformation
+    null,               // lpEnvironment (inherit)
+    null,               // lpCurrentDirectory (inherit)
+    si,                 // lpStartupInfo
+    pi,                 // lpProcessInformation
   );
 
   // Close child-side handles (they were duplicated into the child)
-  k32.CloseHandle(readHandle(stdinRead, 0));
-  k32.CloseHandle(readHandle(stdoutWrite, 0));
+  ffi.closeHandle(readHandle(stdinRead, 0));
+  ffi.closeHandle(readHandle(stdoutWrite, 0));
   // Note: hStdError points to the same stdoutWrite handle — already closed above.
 
   if (!ok) {
-    const err = k32.GetLastError();
-    k32.CloseHandle(readHandle(stdinWrite, 0));
-    k32.CloseHandle(readHandle(stdoutRead, 0));
+    const err = ffi.getLastError();
+    ffi.closeHandle(readHandle(stdinWrite, 0));
+    ffi.closeHandle(readHandle(stdoutRead, 0));
     throw new Error(`CreateProcessW failed: error ${err}`);
   }
 
@@ -233,7 +172,7 @@ export function spawnWin32(commandLine: string): Win32Process {
   const pid = readU32(pi, PI_DWPROCESSID);
 
   // Close thread handle (not needed)
-  k32.CloseHandle(hThread);
+  ffi.closeHandle(hThread);
 
   const parentStdinWrite = readHandle(stdinWrite, 0);
   const parentStdoutRead = readHandle(stdoutRead, 0);
@@ -247,40 +186,40 @@ export function spawnWin32(commandLine: string): Win32Process {
     readStdout(max: number): Uint8Array {
       // Peek first — don't block if no data available
       const availBuf = new ArrayBuffer(4);
-      const peekOk = k32.PeekNamedPipe(parentStdoutRead, null, 0, null, ptr(availBuf), null);
+      const peekOk = ffi.peekNamedPipe(parentStdoutRead, null, 0, null, availBuf, null);
       if (!peekOk) return new Uint8Array(0);
       const avail = readU32(availBuf, 0);
       if (avail === 0) return new Uint8Array(0);
       const toRead = Math.min(avail, max);
       const buf = new Uint8Array(toRead);
-      const ok = k32.ReadFile(parentStdoutRead, ptr(buf.buffer), toRead, ptr(bytesBuf), null);
+      const ok = ffi.readFile(parentStdoutRead, buf.buffer, toRead, bytesBuf, null);
       if (!ok) return new Uint8Array(0);
       const n = readU32(bytesBuf, 0);
       return buf.slice(0, n);
     },
 
     writeStdin(data: Uint8Array): number {
-      const ok = k32.WriteFile(parentStdinWrite, ptr(data.buffer), data.length, ptr(bytesBuf), null);
+      const ok = ffi.writeFile(parentStdinWrite, data.buffer as ArrayBuffer, data.length, bytesBuf, null);
       if (!ok) return 0;
       return readU32(bytesBuf, 0);
     },
 
     sendCtrlBreak(): boolean {
-      return k32.GenerateConsoleCtrlEvent(1, pid) as boolean; // CTRL_BREAK_EVENT=1
+      return ffi.generateConsoleCtrlEvent(1, pid); // CTRL_BREAK_EVENT=1
     },
 
     kill(): void {
       if (killed) return;
       killed = true;
-      k32.TerminateProcess(hProcess, 1);
-      k32.CloseHandle(hProcess);
-      k32.CloseHandle(parentStdinWrite);
-      k32.CloseHandle(parentStdoutRead);
+      ffi.terminateProcess(hProcess, 1);
+      ffi.closeHandle(hProcess);
+      ffi.closeHandle(parentStdinWrite);
+      ffi.closeHandle(parentStdoutRead);
     },
 
     isAlive(): boolean {
       if (killed) return false;
-      const result = k32.WaitForSingleObject(hProcess, 0);
+      const result = ffi.waitForSingleObject(hProcess, 0);
       return result !== 0; // WAIT_OBJECT_0 = 0 means exited
     },
   };

@@ -20,15 +20,15 @@
  * - windbg_search_commands  — search the command catalog by keyword
  */
 
-import { Catalog, entrySyntaxBlock } from "./catalog.ts";
-import { renderCompactCommand, renderFullCommand, renderGuide, GUIDE_URI } from "./resources.ts";
+import { Catalog } from "./catalog.js";
+import { renderCommand, renderGuide, GUIDE_URI } from "./resources.js";
 import {
   type DebuggerSession,
   createCdbExecutableSession,
   createCdbDumpSession,
   createCdbAttachSession,
   createKdSession,
-} from "./session.ts";
+} from "./session.js";
 
 /** Discover-era protocol revision (server/discover). */
 const PROTOCOL_VERSION = "2026-07-28";
@@ -70,7 +70,7 @@ const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and k
 
 ## Resources
 - windbg://guide/overview — full workflow guide
-- windbg://command/{id} — per-command syntax card`;
+- windbg://command/{id} — full command documentation (several KB each; when the client supports subagents, run search + read + synthesis in a subagent to keep the main context lean)`;
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -147,7 +147,7 @@ const TOOLS = [
   {
     name: "windbg_close",
     title: "Close a debug session",
-    description: "End debugging by executing `q`. For a session created by windbg_open_executable the debuggee is terminated with it. For kernel sessions, sends `g` to resume the target before quitting.",
+    description: "End debugging by executing `q`. In user mode, `q` closes the target application whether it was launched (windbg_open_executable) or attached (windbg_attach_process). For kernel sessions, `q` ends the session but leaves the target locked. To detach and leave the target running, use windbg_detach (`qd`) instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -192,7 +192,7 @@ const TOOLS = [
   {
     name: "windbg_detach",
     title: "Detach from a debug session",
-    description: "End debugging by executing `qd` (quit and detach). The debuggee process is NOT terminated and keeps running. Use this after attaching to a production process you must not kill.",
+    description: "End debugging by executing `qd` (quit and detach). Detaches from the target and resumes it, leaving it running (NOT terminated, unlike `q`). Applies to live user-mode and kernel-mode targets, not crash dumps. Use this after attaching to a production process you must not kill.",
     inputSchema: {
       type: "object",
       properties: {
@@ -276,7 +276,7 @@ const TOOLS = [
   {
     name: "windbg_search_commands",
     title: "Search WinDbg command reference",
-    description: "Search the WinDbg/KD command catalog by keyword. Returns matching commands with syntax, summary, and a resource URI for full documentation. Use when unsure of the exact command name or syntax.",
+    description: "Search the WinDbg/KD command catalog by keyword. Returns matching commands with summary and a resource URI for full documentation. Use when unsure of the exact command name.",
     inputSchema: {
       type: "object",
       properties: {
@@ -297,7 +297,6 @@ const TOOLS = [
               title: { type: "string" },
               tokens: { type: "array", items: { type: "string" } },
               summary: { type: "string" },
-              syntax: { type: ["string", "null"], description: "Command syntax (may be null)" },
               resource: { type: "string", description: "URI for full documentation" },
             },
             required: ["id", "title", "tokens", "summary"],
@@ -639,7 +638,6 @@ export class McpServer {
       title: entry.title,
       tokens: entry.tokens,
       summary: entry.summary,
-      syntax: entrySyntaxBlock(entry),
       resource: `windbg://command/${entry.id}`,
     }));
     return toolResult({ results }, { results });
@@ -668,16 +666,9 @@ export class McpServer {
       resourceTemplates: [
         {
           uriTemplate: "windbg://command/{id}",
-          name: "windbg compact command card",
-          title: "WinDbg compact command card",
-          description: "Compact syntax-first WinDbg command card by extracted catalog id",
-          mimeType: "text/plain",
-        },
-        {
-          uriTemplate: "windbg://command-full/{id}",
-          name: "windbg full command page",
-          title: "WinDbg full command page",
-          description: "Full extracted debugger command topic by extracted catalog id",
+          name: "windbg command page",
+          title: "WinDbg command page",
+          description: "Full extracted debugger command topic by catalog id",
           mimeType: "text/plain",
         },
       ],
@@ -702,9 +693,7 @@ export class McpServer {
       throw new Error(`Unknown resource: ${uri}`);
     }
 
-    const content = resolved.kind === "compact"
-      ? renderCompactCommand(resolved.entry)
-      : renderFullCommand(resolved.entry);
+    const content = renderCommand(resolved);
 
     return {
       contents: [{ uri, mimeType: "text/plain", text: content }],

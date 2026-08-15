@@ -1,19 +1,16 @@
 /**
- * Resource rendering — guide, compact command cards, full command pages.
+ * Resource rendering — the workflow guide and the full command page.
  *
- * Mirrors windbg-mcp-rs/src/resources.rs: the guide teaches the low-context
- * workflow, compact cards give syntax-first metadata, and full pages append
- * the complete documentation.
+ * The guide teaches the low-context workflow; the command page renders a
+ * single catalog entry with its routing guidance and complete documentation.
  */
 
 import {
   type Catalog,
   type CatalogEntry,
-  entryFullResourceUri,
   entryRecommendedTool,
-  entrySyntaxBlock,
   entryToolRouting,
-} from "./catalog.ts";
+} from "./catalog.js";
 
 export const GUIDE_URI = "windbg://guide/overview";
 
@@ -26,19 +23,18 @@ export function renderGuide(catalog: Catalog): string {
   out += "1. Open a session: `windbg_open_executable` (start a process), `windbg_open_dump` (crash dump), `windbg_attach_process` (pid/name), or `windbg_attach_kernel` (KDNET/pipe/serial).\n";
   out += "2. List sessions and their states with `windbg_sessions`. Only call `windbg_execute_command` when the session state is `break` (ready_for_commands=true).\n";
   out += "3. If the target is `running` or `busy`, call `windbg_interrupt_target` to break in, then re-check `windbg_sessions`.\n";
-  out += "4. Run commands with `windbg_execute_command`. Read `windbg://command/{id}` for command syntax, `windbg://command-full/{id}` for the full topic.\n";
-  out += "5. End a session with `windbg_close` (`q`; a process started by windbg_open_executable is terminated) or `windbg_detach` (`qd`; the debuggee keeps running).\n\n";
+  out += "4. Run commands with `windbg_execute_command`. Read `windbg://command/{id}` for the full command documentation.\n";
+  out += "5. End a session with `windbg_close` (`q`; in user mode this closes the target application) or `windbg_detach` (`qd`; detaches and leaves the target running — live user-mode or kernel-mode targets, not dumps).\n\n";
 
   out += "Command reference\n";
   out += "-----------------\n";
-  out += "Use windbg_search_commands to find exact syntax for any WinDbg/KD command.\n";
-  out += "Read windbg://command/{id} for a compact card or windbg://command-full/{id} for full docs.\n\n";
+  out += "Use `windbg_search_commands` to find a command, then read `windbg://command/{id}` for its full documentation.\n";
+  out += "Documentation pages can be several KB each; when the client supports subagents, run the search + read + command synthesis in a subagent and return only the final command to the main agent.\n\n";
 
   out += "Key resources\n";
   out += "-------------\n";
   out += `- Guide: ${GUIDE_URI}\n`;
-  out += `- Compact command card template: windbg://command/{id}\n`;
-  out += `- Full command page template: windbg://command-full/{id}\n\n`;
+  out += `- Command page template: windbg://command/{id}\n\n`;
   out += "Key tools\n";
   out += "---------\n";
   out += "- windbg_open_executable\n";
@@ -55,7 +51,7 @@ export function renderGuide(catalog: Catalog): string {
   return out;
 }
 
-export function renderCompactCommand(entry: CatalogEntry): string {
+export function renderCommand(entry: CatalogEntry): string {
   let out = "";
   out += `Title: ${entry.title}\n`;
   out += `Catalog Id: ${entry.id}\n`;
@@ -66,19 +62,10 @@ export function renderCompactCommand(entry: CatalogEntry): string {
   const rec = entryRecommendedTool(entry);
   out += rec ? `Recommended Tool: ${rec}\n` : "Recommended Tool: documentation only\n";
 
-  out += `Full Resource: ${entryFullResourceUri(entry)}\n`;
-
-  const syntax = entrySyntaxBlock(entry);
-  if (syntax) {
-    out += "\nSyntax\n------\n";
-    out += syntax;
-    out += "\n";
-  }
-
   out += "\nNext Step\n---------\n";
   switch (entryToolRouting(entry)) {
     case "execute_command":
-      out += "Build the final WinDbg command string from the syntax above, call `windbg_sessions` to check state, interrupt if needed, and then call `windbg_execute_command`.\n";
+      out += "Read the documentation below, call `windbg_sessions` to confirm the session is ready (break state), interrupt if needed, then run the command with `windbg_execute_command`.\n";
       break;
     case "interrupt_target":
       out += "This topic maps to an engine-level break action. Use `windbg_interrupt_target` instead of `windbg_execute_command`.\n";
@@ -88,11 +75,6 @@ export function renderCompactCommand(entry: CatalogEntry): string {
       break;
   }
 
-  return out;
-}
-
-export function renderFullCommand(entry: CatalogEntry): string {
-  let out = renderCompactCommand(entry);
   out += "\nDocumentation\n-------------\n";
   out += entry.documentation;
   return out;
