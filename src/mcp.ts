@@ -57,8 +57,8 @@ const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and k
 - Start a new process under the debugger → windbg_open_executable
 - Debug a kernel target (VM, test machine) → windbg_attach_kernel with a connection string
 - Check debugger state → windbg_sessions (look for ready_for_commands=true)
-- Target is running, need prompt → windbg_interrupt_target, then re-check windbg_sessions
-- Run any debugger command → windbg_execute_command
+- Need a prompt while a command is pending → windbg_interrupt_target (also cancels dump commands)
+- Run a debugger command → windbg_execute_command; use wait_for_completion:false for g, and omit command to collect pending results
 - Unsure of the exact command → windbg_search_commands with a keyword
 - End session, kill debuggee → windbg_close
 - End session, keep debuggee running → windbg_detach
@@ -84,19 +84,32 @@ interface SessionRecord {
 
 let sessionCounter = 0;
 const sessions = new Map<string, SessionRecord>();
+// Factories spawn synchronously, before start() has received the first prompt.
+const openingSessions = new Set<DebuggerSession>();
 
 /** Close every open session (kills kd/cdb children). Used on server exit. */
 export async function closeAllSessions(): Promise<void> {
-  const all = [...sessions.values()];
-  sessions.clear();
-  await Promise.allSettled(all.map((rec) => rec.session.close()));
+  // A session still opening cannot receive a safe debugger quit command yet.
+  const opening = [...openingSessions];
+  openingSessions.clear();
+  for (const session of opening) {
+    try { session.killSync(); } catch { /* Keep closing registered sessions. */ }
+  }
+  await Promise.allSettled([...sessions.values()].map(async (rec) => {
+    await rec.session.close();
+    sessions.delete(rec.id);
+  }));
+  // Failed closes stay registered for the synchronous exit fallback.
 }
 
 /** Synchronously kill every session's debugger child. Used from "exit" handler. */
 export function killAllSessionsSync(): void {
-  const all = [...sessions.values()];
+  const all = [...sessions.values()].map((rec) => rec.session).concat([...openingSessions]);
+  openingSessions.clear();
+  for (const session of all) {
+    try { session.killSync(); } catch { /* Continue cleaning up other sessions. */ }
+  }
   sessions.clear();
-  for (const rec of all) rec.session.killSync();
 }
 
 function genSessionId(): string {
@@ -104,9 +117,6 @@ function genSessionId(): string {
   return sessionCounter.toString(16).padStart(8, "0");
 }
 
-function getSessionById(id: string): SessionRecord | null {
-  return sessions.get(id) ?? null;
-}
 
 // ---------------------------------------------------------------------------
 // Tool definitions
@@ -116,7 +126,7 @@ const TOOLS = [
   {
     name: "windbg_open_executable",
     title: "Start and debug an executable",
-    description: "Launch a process under cdb.exe. Returns a session_id. The debuggee runs as a child of cdb; windbg_close terminates it, windbg_detach lets it keep running.\nAfter opening: set symbols with \".symfix\" + \".reload\", then run \"g\" to start execution or \"bp <symbol>\" to set breakpoints first.",
+    description: "Launch a process under cdb.exe. Returns a session_id. The debuggee runs as a child of cdb; windbg_close terminates it, windbg_detach lets it keep running.\nAfter opening: set symbols with \".symfix\" + \".reload\", then run \"g\" with wait_for_completion:false to start execution or \"bp <symbol>\" to set breakpoints first.",
     inputSchema: {
       type: "object",
       properties: {
@@ -124,7 +134,7 @@ const TOOLS = [
         args: { type: "array", items: { type: "string" }, description: "Optional command-line arguments for the debuggee" },
         cdb_path: { type: "string", description: "Custom cdb.exe path (auto-detected if omitted)" },
         symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", description: "Seconds to wait for the debugger to become ready (default 60)" },
+        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for the debugger to become ready (default 60)" },
       },
       required: ["executable"],
     },
@@ -139,7 +149,7 @@ const TOOLS = [
         dump_path: { type: "string", description: "Path to the crash dump file" },
         cdb_path: { type: "string", description: "Custom cdb.exe path" },
         symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", description: "Seconds to wait for the debugger to become ready (default 60)" },
+        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for the debugger to become ready (default 60)" },
       },
       required: ["dump_path"],
     },
@@ -162,11 +172,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        pid: { type: "number", description: "Decimal process ID to attach to (-p)" },
+        pid: { type: "integer", minimum: 1, description: "Decimal process ID to attach to (-p)" },
         name: { type: "string", description: "Process name to attach to (-pn), e.g. notepad.exe" },
         cdb_path: { type: "string", description: "Custom cdb.exe path" },
         symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", description: "Seconds to wait for attach (default 60)" },
+        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for attach (default 60)" },
       },
       oneOf: [
         { required: ["pid"] },
@@ -184,7 +194,7 @@ const TOOLS = [
         kernel_connection: { type: "string", description: "Kernel connection string (-k)" },
         kd_path: { type: "string", description: "Custom kd.exe path" },
         symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", description: "Seconds to wait for the target to connect (default 60)" },
+        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for the target to connect (default 60)" },
       },
       required: ["kernel_connection"],
     },
@@ -203,7 +213,7 @@ const TOOLS = [
   {
     name: "windbg_sessions",
     title: "List active debug sessions",
-    description: "List all active debug sessions. Each entry includes session_id, type (executable/dump/process/kernel), kind (cdb/kd), target, and state. Check state.ready_for_commands before calling windbg_execute_command — if false, call windbg_interrupt_target first.",
+    description: "List active sessions with their type, target and state. Submit a new command only when ready_for_commands is true. A busy session may be running a target or executing a debugger command; running:null means unknown. Omit command in windbg_execute_command to collect a pending result, or use windbg_interrupt_target to cancel it.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -226,7 +236,7 @@ const TOOLS = [
                 properties: {
                   status_name: { type: "string" },
                   ready_for_commands: { type: "boolean", description: "True if the debugger accepts commands" },
-                  running: { type: "boolean" },
+                  running: { type: ["boolean", "null"], description: "Null when the text channel cannot distinguish a running target from a busy debugger" },
                   busy: { type: "boolean" },
                 },
               },
@@ -240,8 +250,8 @@ const TOOLS = [
   },
   {
     name: "windbg_interrupt_target",
-    title: "Interrupt the running target",
-    description: "Break into a running target (like pressing Ctrl+C in the debugger console). Use when the target is running and you need to enter commands. After interrupting, call windbg_sessions to confirm state changed to break.",
+    title: "Interrupt a target or debugger command",
+    description: "Send CTRL+BREAK and wait for a confirmed command prompt. Stops a running live target or cancels a debugger command, including commands in dump sessions. Reports an error if the interrupt fails; use windbg_execute_command without command to collect the pending command's output afterward.",
     inputSchema: {
       type: "object",
       properties: {
@@ -252,25 +262,26 @@ const TOOLS = [
   {
     name: "windbg_execute_command",
     title: "Execute a debugger command",
-    description: "Execute any WinDbg/KD command string. The debugger must be at a prompt (break state) — check windbg_sessions first.\nCommon commands: \"kb\" (stack trace), \"lm\" (loaded modules), \"dt <type>\" (display type), \"dv\" (local variables), \"r\" (registers), \"u <addr>\" (disassemble), \"d <addr>\" (display memory), \"bp <symbol>\" (set breakpoint), \"g\" (continue), \"!analyze -v\" (crash analysis), \".symfix\" + \".reload\" (set symbols).",
+    description: "Execute any WinDbg/KD command string. A new command requires a debugger prompt. Omit command to collect the cumulative output of the most recent command without running it again. timeout is a waiting budget, not a command deadline: completed:false leaves the command running, without automatically interrupting it. Use wait_for_completion:false for \"g\", then interrupt when needed and collect results by omitting command.\nCommon commands: \"kb\" (stack trace), \"lm\" (loaded modules), \"dt <type>\" (display type), \"dv\" (local variables), \"r\" (registers), \"u <addr>\" (disassemble), \"d <addr>\" (display memory), \"bp <symbol>\" (set breakpoint), \"g\" (continue), \"!analyze -v\" (crash analysis), \".symfix\" + \".reload\" (set symbols).",
     inputSchema: {
       type: "object",
       properties: {
-        command: { type: "string", description: "The debugger command string to execute (e.g. kb, lm, !analyze -v)" },
+        command: { type: "string", description: "New debugger command; omit to collect the most recent command's output without executing again" },
         session_id: { type: "string", description: "Session id (uses the active session if omitted)" },
-        timeout: { type: "number", description: "Override the session timeout in seconds" },
+        timeout: { type: "number", exclusiveMinimum: 0, description: "Positive waiting budget in seconds; unfinished commands continue after it expires" },
+        wait_for_completion: { type: "boolean", default: true, description: "Wait for completion within timeout; false returns an immediate cumulative output snapshot" },
       },
-      required: ["command"],
     },
     outputSchema: {
       type: "object",
       properties: {
         command: { type: "string" },
         output: { type: "string", description: "Raw debugger output text" },
+        completed: { type: "boolean", description: "Whether the command has finished; false means output may still grow" },
         state_before: { type: "object" },
         state_after: { type: "object" },
       },
-      required: ["command", "output"],
+      required: ["command", "output", "completed"],
     },
   },
   {
@@ -281,7 +292,7 @@ const TOOLS = [
       type: "object",
       properties: {
         query: { type: "string", description: "Search query (e.g. 'breakpoint', 'stack trace', 'dt', '.sympath')" },
-        limit: { type: "number", description: "Max results to return (default 10)" },
+        limit: { type: "integer", minimum: 1, description: "Max results to return (default 10)" },
       },
       required: ["query"],
     },
@@ -319,22 +330,20 @@ export class McpServer {
     this.catalog = Catalog.load();
   }
 
-  /** Process a single JSON-RPC request and return the result (or error). */
+  /** Validate the MCP envelope before deciding whether this is a notification. */
   async handle(request: unknown): Promise<unknown> {
-    if (typeof request !== "object" || request === null) {
-      return jsonRpcError(null, -32600, "Invalid Request");
+    if (!isObject(request)) return jsonRpcError(null, -32600, "Invalid Request");
+    const hasId = Object.hasOwn(request, "id");
+    const { id, method, params } = request;
+    const validId = typeof id === "string" || (typeof id === "number" && Number.isInteger(id));
+    if (request.jsonrpc !== "2.0" || typeof method !== "string" ||
+        (hasId && !validId) || (Object.hasOwn(request, "params") && !isObject(params))) {
+      return jsonRpcError(validId ? id : null, -32600, "Invalid Request");
     }
-    const { id, method, params } = request as { id?: unknown; method?: unknown; params?: unknown };
-    const isNotification = id === undefined || id === null;
-
-    if (typeof method !== "string") {
-      if (isNotification) return null;
-      return jsonRpcError(id, -32600, "Invalid Request: missing method");
-    }
+    const isNotification = !hasId;
 
     try {
       let result: unknown;
-
       switch (method) {
         case "server/discover":
           result = this.handleDiscover();
@@ -361,16 +370,12 @@ export class McpServer {
           result = { resultType: "complete" };
           break;
         default:
-          if (isNotification) return null;
-          return jsonRpcError(id, -32601, `Method not found: ${method}`);
+          throw new RpcError(-32601, `Method not found: ${method}`);
       }
-
-      if (isNotification) return null;
-      return { jsonrpc: "2.0", id, result };
+      return isNotification ? null : { jsonrpc: "2.0", id, result };
     } catch (err) {
       if (isNotification) return null;
-      const message = err instanceof Error ? err.message : String(err);
-      return jsonRpcError(id, -32603, message);
+      return jsonRpcError(id, err instanceof RpcError ? err.code : -32603, errMsg(err));
     }
   }
 
@@ -397,11 +402,16 @@ export class McpServer {
   }
 
   private handleLegacyInitialize(params: unknown): unknown {
+    if (!isObject(params) || typeof params.protocolVersion !== "string" ||
+        !isObject(params.capabilities) || !isObject(params.clientInfo) ||
+        typeof params.clientInfo.name !== "string" || typeof params.clientInfo.version !== "string") {
+      throw new RpcError(-32602, "initialize requires protocolVersion, capabilities and clientInfo");
+    }
     // Version negotiation: echo the client's requested version when we
     // support it (spec: server MUST respond with the same version); fall
     // back to the newest version mainstream SDKs recognize otherwise.
-    const requested = (params as { protocolVersion?: unknown } | undefined)?.protocolVersion;
-    const negotiated = typeof requested === "string" && SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
+    const requested = params.protocolVersion;
+    const negotiated = SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
       ? requested
       : LATEST_OFFICIAL_VERSION;
     return {
@@ -430,86 +440,78 @@ export class McpServer {
   }
 
   private async handleToolsCall(params: unknown): Promise<unknown> {
-    const p = (params ?? {}) as { name?: unknown; arguments?: unknown };
-    const name = typeof p.name === "string" ? p.name : "";
-    const args = (typeof p.arguments === "object" && p.arguments !== null
-      ? p.arguments
-      : {}) as Record<string, unknown>;
+    if (!isObject(params) || typeof params.name !== "string" || !params.name ||
+        (Object.hasOwn(params, "arguments") && !isObject(params.arguments))) {
+      throw new RpcError(-32602, "tools/call requires a tool name and object arguments");
+    }
+    const name = params.name;
+    if (!TOOLS.some((tool) => tool.name === name)) {
+      throw new RpcError(-32602, `Unknown tool: ${name}`);
+    }
+    const args = (params.arguments ?? {}) as Record<string, unknown>;
+    const invalid = validateToolArguments(name, args);
+    if (invalid) return toolError(invalid);
 
-    switch (name) {
-      case "windbg_open_executable":
-        return await this.toolOpenExecutable(args);
-      case "windbg_open_dump":
-        return await this.toolOpenDump(args);
-      case "windbg_close":
-        return await this.toolClose(args);
-      case "windbg_attach_process":
-        return await this.toolAttachProcess(args);
-      case "windbg_attach_kernel":
-        return await this.toolAttachKernel(args);
-      case "windbg_detach":
-        return await this.toolDetach(args);
-      case "windbg_sessions":
-        return await this.toolSessions(args);
-      case "windbg_interrupt_target":
-        return await this.toolInterruptTarget(args);
-      case "windbg_execute_command":
-        return await this.toolExecuteCommand(args);
-      case "windbg_search_commands":
-        return this.toolSearchCommands(args);
-      default:
-        throw new Error(`Unknown tool: ${name}`);
+    try {
+      switch (name) {
+        case "windbg_open_executable": return await this.toolOpenExecutable(args);
+        case "windbg_open_dump": return await this.toolOpenDump(args);
+        case "windbg_close": return await this.toolClose(args);
+        case "windbg_attach_process": return await this.toolAttachProcess(args);
+        case "windbg_attach_kernel": return await this.toolAttachKernel(args);
+        case "windbg_detach": return await this.toolDetach(args);
+        case "windbg_sessions": return await this.toolSessions(args);
+        case "windbg_interrupt_target": return await this.toolInterruptTarget(args);
+        case "windbg_execute_command": return await this.toolExecuteCommand(args);
+        case "windbg_search_commands": return this.toolSearchCommands(args);
+      }
+    } catch (err) {
+      // Runtime debugger failures belong to the tool result, not JSON-RPC.
+      return toolError(errMsg(err));
+    }
+  }
+
+  private async startSession(session: DebuggerSession, type: SessionRecord["type"], target: string): Promise<unknown> {
+    openingSessions.add(session);
+    try {
+      await session.start();
+      const state = await session.queryState();
+      if (!openingSessions.has(session)) throw new Error("Server is shutting down");
+      const id = genSessionId();
+      sessions.set(id, { id, type, session });
+      return toolResult({ session_id: id, kind: session.kind, type, target, state });
+    } catch (err) {
+      session.killSync();
+      throw err;
+    } finally {
+      openingSessions.delete(session);
     }
   }
 
   private async toolOpenExecutable(args: Record<string, unknown>): Promise<unknown> {
-    const executable = args.executable;
-    if (typeof executable !== "string" || !executable) {
-      return toolError("Missing required argument: executable");
-    }
-    const execArgs = Array.isArray(args.args) ? args.args.filter((a): a is string => typeof a === "string") : [];
+    const executable = args.executable as string;
+    const execArgs = (args.args ?? []) as string[];
     try {
       const session = createCdbExecutableSession(executable, execArgs, {
         cdbPath: strOrUndefined(args.cdb_path),
         symbolsPath: strOrUndefined(args.symbols_path),
         timeout: numOrUndefined(args.timeout),
       });
-      await session.start();
-      const id = genSessionId();
-      sessions.set(id, { id, type: "executable", session });
-      return toolResult({
-        session_id: id,
-        kind: "cdb",
-        type: "executable",
-        target: executable,
-        state: await session.queryState(),
-      });
+      return await this.startSession(session, "executable", executable);
     } catch (e) {
       return toolError(`Failed to start debug session: ${errMsg(e)}`);
     }
   }
 
   private async toolOpenDump(args: Record<string, unknown>): Promise<unknown> {
-    const dumpPath = args.dump_path;
-    if (typeof dumpPath !== "string" || !dumpPath) {
-      return toolError("Missing required argument: dump_path");
-    }
+    const dumpPath = args.dump_path as string;
     try {
       const session = createCdbDumpSession(dumpPath, {
         cdbPath: strOrUndefined(args.cdb_path),
         symbolsPath: strOrUndefined(args.symbols_path),
         timeout: numOrUndefined(args.timeout),
       });
-      await session.start();
-      const id = genSessionId();
-      sessions.set(id, { id, type: "dump", session });
-      return toolResult({
-        session_id: id,
-        kind: "cdb",
-        type: "dump",
-        target: dumpPath,
-        state: await session.queryState(),
-      });
+      return await this.startSession(session, "dump", dumpPath);
     } catch (e) {
       return toolError(`Failed to open dump: ${errMsg(e)}`);
     }
@@ -526,9 +528,6 @@ export class McpServer {
   private async toolAttachProcess(args: Record<string, unknown>): Promise<unknown> {
     const pid = typeof args.pid === "number" ? String(args.pid) : undefined;
     const name = typeof args.name === "string" && args.name ? args.name : undefined;
-    if (!pid && !name) {
-      return toolError("Provide either pid or name to attach to a process");
-    }
     const attachSpec = pid ?? name!;
     try {
       const session = createCdbAttachSession(attachSpec, {
@@ -536,42 +535,21 @@ export class McpServer {
         symbolsPath: strOrUndefined(args.symbols_path),
         timeout: numOrUndefined(args.timeout),
       });
-      await session.start();
-      const id = genSessionId();
-      sessions.set(id, { id, type: "process", session });
-      return toolResult({
-        session_id: id,
-        kind: "cdb",
-        type: "process",
-        target: session.target,
-        state: await session.queryState(),
-      });
+      return await this.startSession(session, "process", session.target);
     } catch (e) {
       return toolError(`Failed to attach to process: ${errMsg(e)}`);
     }
   }
 
   private async toolAttachKernel(args: Record<string, unknown>): Promise<unknown> {
-    const kernel = args.kernel_connection;
-    if (typeof kernel !== "string" || !kernel) {
-      return toolError("Missing required argument: kernel_connection");
-    }
+    const kernel = args.kernel_connection as string;
     try {
       const session = createKdSession(kernel, {
         kdPath: strOrUndefined(args.kd_path),
         symbolsPath: strOrUndefined(args.symbols_path),
         timeout: numOrUndefined(args.timeout),
       });
-      await session.start();
-      const id = genSessionId();
-      sessions.set(id, { id, type: "kernel", session });
-      return toolResult({
-        session_id: id,
-        kind: "kd",
-        type: "kernel",
-        target: kernel,
-        state: await session.queryState(),
-      });
+      return await this.startSession(session, "kernel", kernel);
     } catch (e) {
       return toolError(`Failed to connect to kernel target: ${errMsg(e)}`);
     }
@@ -610,18 +588,16 @@ export class McpServer {
   }
 
   private async toolExecuteCommand(args: Record<string, unknown>): Promise<unknown> {
-    const command = args.command;
-    if (typeof command !== "string" || !command) {
-      return toolError("Missing required argument: command");
-    }
+    const command = strOrUndefined(args.command);
     const rec = resolveSession(args.session_id);
     if (!rec) return toolError("No matching debug session. Use windbg_sessions to list open sessions.");
 
     const timeout = numOrUndefined(args.timeout);
-    const result = await rec.session.execute(command, timeout);
+    const result = await rec.session.execute(command, timeout, (args.wait_for_completion as boolean | undefined) ?? true);
     const payload = {
       command: result.command,
       output: result.output,
+      completed: result.completed,
       state_before: result.state_before,
       state_after: result.state_after,
     };
@@ -629,10 +605,8 @@ export class McpServer {
   }
 
   private toolSearchCommands(args: Record<string, unknown>): unknown {
-    const query = typeof args.query === "string" ? args.query.trim() : "";
-    if (!query) return toolError("Missing required argument: query");
+    const query = (args.query as string).trim();
     const limit = numOrUndefined(args.limit) ?? 10;
-    if (limit < 1) return toolError("Invalid argument: limit must be >= 1");
     const results = this.catalog.search(query, limit).map((entry) => ({
       id: entry.id,
       title: entry.title,
@@ -676,11 +650,12 @@ export class McpServer {
   }
 
   private handleResourcesRead(params: unknown): unknown {
-    const p = (params ?? {}) as { uri?: unknown };
-    const uri = typeof p.uri === "string" ? p.uri : "";
-    if (!uri) {
-      throw new Error("Missing uri parameter");
+    if (!isObject(params) || typeof params.uri !== "string" || !params.uri) {
+      throw new RpcError(-32602, "resources/read requires a string uri");
     }
+    const uri = params.uri;
+    try { new URL(uri); }
+    catch { throw new RpcError(-32602, "Invalid resource URI"); }
 
     if (uri === GUIDE_URI) {
       return {
@@ -690,7 +665,7 @@ export class McpServer {
 
     const resolved = this.catalog.resolveResourceUri(uri);
     if (!resolved) {
-      throw new Error(`Unknown resource: ${uri}`);
+      throw new RpcError(-32002, `Unknown resource: ${uri}`);
     }
 
     const content = renderCommand(resolved);
@@ -705,9 +680,99 @@ export class McpServer {
 // Helpers
 // ---------------------------------------------------------------------------
 
+class RpcError extends Error {
+  constructor(readonly code: number, message: string) {
+    super(message);
+  }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateToolArguments(name: string, args: Record<string, unknown>): string | undefined {
+  let strings: readonly string[] = [];
+  let required: readonly string[] = [];
+  let acceptsTimeout = false;
+  switch (name) {
+    case "windbg_open_executable":
+      strings = ["executable", "cdb_path", "symbols_path"];
+      required = ["executable"];
+      acceptsTimeout = true;
+      if (Object.hasOwn(args, "args") &&
+          (!Array.isArray(args.args) || !args.args.every((arg) => typeof arg === "string"))) {
+        return "Invalid argument: args must be an array of strings";
+      }
+      break;
+    case "windbg_open_dump":
+      strings = ["dump_path", "cdb_path", "symbols_path"];
+      required = ["dump_path"];
+      acceptsTimeout = true;
+      break;
+    case "windbg_attach_process":
+      strings = ["name", "cdb_path", "symbols_path"];
+      acceptsTimeout = true;
+      if (Object.hasOwn(args, "pid") === Object.hasOwn(args, "name")) {
+        return "Provide exactly one of pid or name";
+      }
+      if (Object.hasOwn(args, "pid") &&
+          (typeof args.pid !== "number" || !Number.isInteger(args.pid) || args.pid <= 0)) {
+        return "Invalid argument: pid must be a positive integer";
+      }
+      if (Object.hasOwn(args, "name")) required = ["name"];
+      break;
+    case "windbg_attach_kernel":
+      strings = ["kernel_connection", "kd_path", "symbols_path"];
+      required = ["kernel_connection"];
+      acceptsTimeout = true;
+      break;
+    case "windbg_close":
+    case "windbg_detach":
+    case "windbg_interrupt_target":
+      strings = ["session_id"];
+      break;
+    case "windbg_execute_command":
+      strings = ["session_id", "command"];
+      acceptsTimeout = true;
+      if (Object.hasOwn(args, "wait_for_completion") && typeof args.wait_for_completion !== "boolean") {
+        return "Invalid argument: wait_for_completion must be a boolean";
+      }
+      break;
+    case "windbg_search_commands":
+      strings = ["query"];
+      required = ["query"];
+      if (Object.hasOwn(args, "limit") &&
+          (typeof args.limit !== "number" || !Number.isInteger(args.limit) || args.limit <= 0)) {
+        return "Invalid argument: limit must be a positive integer";
+      }
+      break;
+  }
+  for (const key of strings) {
+    if (Object.hasOwn(args, key) && typeof args[key] !== "string") {
+      return `Invalid argument: ${key} must be a string`;
+    }
+  }
+  for (const key of required) {
+    const value = args[key];
+    if (typeof value !== "string" || !value.trim()) {
+      return `Missing required non-empty string argument: ${key}`;
+    }
+  }
+  for (const key of ["session_id", "command"]) {
+    if (strings.includes(key) && Object.hasOwn(args, key) && !(args[key] as string).trim()) {
+      return `Invalid argument: ${key} must not be empty`;
+    }
+  }
+  if (acceptsTimeout && Object.hasOwn(args, "timeout") &&
+      (typeof args.timeout !== "number" || !Number.isFinite(args.timeout) || args.timeout <= 0)) {
+    return "Invalid argument: timeout must be a positive finite number";
+  }
+  return undefined;
+}
+
 function resolveSession(sessionId: unknown): SessionRecord | null {
-  if (typeof sessionId === "string" && sessionId) {
-    return getSessionById(sessionId);
+  if (sessionId !== undefined) {
+    return typeof sessionId === "string" && sessionId ? sessions.get(sessionId) ?? null : null;
   }
   // No session_id → the most recently opened session.
   let last: SessionRecord | null = null;

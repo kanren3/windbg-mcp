@@ -1,15 +1,8 @@
 #!/usr/bin/env node
 /**
- * windbg-mcp — stdio MCP server entry point.
- *
- * Reads newline-delimited JSON-RPC 2.0 from stdin, dispatches to McpServer,
- * writes responses to stdout. Exits when stdin closes (EOF).
- *
- * Requests are serialized: each dispatch is chained onto the previous one so
- * concurrent pipelined requests can't interleave and corrupt the session
- * marker protocol.
- *
- * On exit, closes all debug sessions so no kd/cdb child processes are leaked.
+ * Newline-delimited UTF-8 JSON-RPC over stdio. Requests dispatch concurrently;
+ * each debugger session serializes its own writes so interrupt and ping remain
+ * responsive. EOF drains accepted requests before closing debugger children.
  */
 
 import { McpServer, closeAllSessions, killAllSessionsSync } from "./mcp.js";
@@ -18,31 +11,55 @@ async function main(): Promise<void> {
   const server = new McpServer();
   const stdin = process.stdin;
   const stdout = process.stdout;
-
-
+  const inFlight = new Set<Promise<void>>();
   let buffer = "";
-  // Serialize dispatches: each request waits for the previous one to settle.
-  let tail: Promise<void> = Promise.resolve();
+  let accepting = true;
+  let finishing: Promise<void> | undefined;
+  let closing: Promise<void> | undefined;
 
-  stdin.on("data", (chunk: Buffer) => {
-    buffer += chunk.toString("utf-8");
+  function shutdown(exitCode = 0, signal = false): Promise<void> {
+    accepting = false;
+    stdin.pause();
+    // A signal may interrupt requests; EOF must first finish accepted input.
+    if (signal && !closing) closing = closeAllSessions();
+    if (finishing) return finishing;
+    finishing = (async () => {
+      await Promise.allSettled([...inFlight]);
+      await (closing ?? closeAllSessions());
+      // Flush every response before exiting; process.exit alone can lose writes.
+      await new Promise<void>((resolve) => stdout.end(resolve));
+      process.exit(exitCode);
+    })();
+    return finishing;
+  }
+
+  stdin.setEncoding("utf8");
+  stdin.on("data", (chunk: string) => {
+    if (!accepting) return;
+    buffer += chunk;
     let nl: number;
     while ((nl = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, nl).trim();
       buffer = buffer.slice(nl + 1);
       if (!line) continue;
-      tail = tail.then(() => dispatch(server, line, stdout));
+      const pending = dispatch(server, line, stdout).catch((err) => {
+        console.error("Fatal dispatch error:", err);
+        void shutdown(1);
+      });
+      inFlight.add(pending);
+      void pending.then(() => inFlight.delete(pending));
     }
   });
 
-  stdin.on("end", () => {
-    // Wait for in-flight dispatches to settle before exiting.
-    void tail.finally(() => process.exit(0));
+  stdin.on("end", () => { void shutdown(); });
+  stdin.on("close", () => { void shutdown(); });
+  stdin.on("error", (err) => {
+    console.error("stdin error:", err);
+    void shutdown(1, true);
   });
-
-  stdin.on("close", () => {
-    void tail.finally(() => process.exit(0));
-  });
+  process.on("SIGINT", () => { void shutdown(0, true); });
+  process.on("SIGTERM", () => { void shutdown(0, true); });
+  process.on("SIGHUP", () => { void shutdown(0, true); });
 }
 
 async function dispatch(server: McpServer, line: string, stdout: NodeJS.WriteStream): Promise<void> {
@@ -50,7 +67,6 @@ async function dispatch(server: McpServer, line: string, stdout: NodeJS.WriteStr
   try {
     request = JSON.parse(line);
   } catch {
-    // JSON-RPC 2.0: parse errors get a -32700 response with id: null.
     stdout.write(JSON.stringify({
       jsonrpc: "2.0",
       id: null,
@@ -60,31 +76,14 @@ async function dispatch(server: McpServer, line: string, stdout: NodeJS.WriteStr
   }
 
   const result = await server.handle(request);
-  if (result === null) return; // notification, no response
-
-  stdout.write(JSON.stringify(result) + "\n");
+  if (result !== null) stdout.write(JSON.stringify(result) + "\n");
 }
 
-// Clean up debug sessions on every exit path: no leaked kd/cdb children.
-let cleaning = false;
-async function shutdown(): Promise<void> {
-  if (cleaning) return;
-  cleaning = true;
-  try {
-    await closeAllSessions();
-  } catch { /* best effort */ }
-  process.exit(0);
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-process.on("SIGHUP", shutdown);
-process.on("exit", () => {
-  // Synchronous exit path: can't await, so just kill every debugger child.
-  killAllSessionsSync();
-});
+// The synchronous fallback includes sessions still waiting for their first prompt.
+process.on("exit", killAllSessionsSync);
 
 main().catch((err) => {
   console.error("Fatal error:", err);
-  void closeAllSessions().finally(() => process.exit(1));
+  killAllSessionsSync();
+  process.exit(1);
 });

@@ -21,9 +21,9 @@ export function renderGuide(catalog: Catalog): string {
   out += "Workflow\n";
   out += "--------\n";
   out += "1. Open a session: `windbg_open_executable` (start a process), `windbg_open_dump` (crash dump), `windbg_attach_process` (pid/name), or `windbg_attach_kernel` (KDNET/pipe/serial).\n";
-  out += "2. List sessions and their states with `windbg_sessions`. Only call `windbg_execute_command` when the session state is `break` (ready_for_commands=true).\n";
-  out += "3. If the target is `running` or `busy`, call `windbg_interrupt_target` to break in, then re-check `windbg_sessions`.\n";
-  out += "4. Run commands with `windbg_execute_command`. Read `windbg://command/{id}` for the full command documentation.\n";
+  out += "2. Check `windbg_sessions` before submitting a new command. `ready_for_commands=true` means a prompt was confirmed; `running=null` means the target's execution state is unknown.\n";
+  out += "3. Use `windbg_execute_command` with `wait_for_completion=false` for commands such as `g`. A wait timeout returns `completed=false` and leaves the command pending. Omit `command` to collect its cumulative output without executing it again.\n";
+  out += "4. Call `windbg_interrupt_target` to stop a running target or cancel a debugger command, including dump analysis. It waits for a confirmed command prompt.\n";
   out += "5. End a session with `windbg_close` (`q`; in user mode this closes the target application) or `windbg_detach` (`qd`; detaches and leaves the target running — live user-mode or kernel-mode targets, not dumps).\n\n";
 
   out += "Command reference\n";
@@ -57,6 +57,7 @@ export function renderCommand(entry: CatalogEntry): string {
   out += `Catalog Id: ${entry.id}\n`;
   out += `Tokens: ${entry.tokens.join(", ")}\n`;
   out += `Summary: ${entry.summary}\n`;
+  if (entry.source) out += `Source: ${entry.source}\n`;
   out += `Tool Route: ${entryToolRouting(entry)}\n`;
 
   const rec = entryRecommendedTool(entry);
@@ -65,7 +66,7 @@ export function renderCommand(entry: CatalogEntry): string {
   out += "\nNext Step\n---------\n";
   switch (entryToolRouting(entry)) {
     case "execute_command":
-      out += "Read the documentation below, call `windbg_sessions` to confirm the session is ready (break state), interrupt if needed, then run the command with `windbg_execute_command`.\n";
+      out += "Confirm ready_for_commands before submitting a new command. Use wait_for_completion=false for execution-control commands; omit command on later calls to collect a pending result. To cancel it, use windbg_interrupt_target.\n";
       break;
     case "interrupt_target":
       out += "This topic maps to an engine-level break action. Use `windbg_interrupt_target` instead of `windbg_execute_command`.\n";

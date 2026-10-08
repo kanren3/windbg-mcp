@@ -1,9 +1,9 @@
 /**
  * Command catalog — types, loading, search, and URI resolution.
  *
- * Entries are extracted from the debugger.chm documentation, each with an id,
- * section, title, summary, tokens, and full documentation. Command pages are
- * addressed by `windbg://command/{id}`.
+ * Entries come from debugger.chm and local debuggercmds Markdown references,
+ * each with an id, section, title, summary, tokens, and full documentation.
+ * Command pages are addressed by `windbg://command/{id}`.
  */
 
 import { readFileSync } from "node:fs";
@@ -12,7 +12,7 @@ import { readFileSync } from "node:fs";
 // Types
 // ---------------------------------------------------------------------------
 
-export type CatalogSection = "command" | "meta_command";
+export type CatalogSection = "command" | "meta_command" | "extension";
 
 export type ToolRouting = "execute_command" | "interrupt_target" | "documentation_only";
 
@@ -26,6 +26,7 @@ export interface CatalogEntry {
   user_mode_syntax: string | null;
   kernel_mode_syntax: string | null;
   documentation: string;
+  source?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +80,7 @@ export class Catalog {
     // Validate section values
     const entries = raw.map((e): CatalogEntry => ({
       ...e,
-      section: e.section === "meta_command" ? "meta_command" : "command",
+      section: e.section === "meta_command" || e.section === "extension" ? e.section : "command",
     }));
     Catalog.instance = new Catalog(entries);
     return Catalog.instance;
@@ -147,18 +148,20 @@ export class Catalog {
 
   renderIndex(): string {
     const commandCount = this.entries.filter((e) => e.section === "command").length;
-    const metaCount = this.len() - commandCount;
+    const metaCount = this.entries.filter((e) => e.section === "meta_command").length;
+    const extensionCount = this.entries.filter((e) => e.section === "extension").length;
 
     let out = "";
     out += "WinDbg MCP guide\n\n";
     out += "Recommended flow:\n";
     out += "1. Find a command with `windbg_search_commands`, then read `windbg://command/{id}` for its full documentation.\n";
     out += "2. Call `windbg_sessions` to check the debugger state before execution.\n";
-    out += "3. If the debugger is running or busy, call `windbg_interrupt_target` and then verify state again.\n";
-    out += "4. Call `windbg_execute_command` only when the debugger is ready for commands.\n\n";
+    out += "3. Collect a pending command by calling `windbg_execute_command` without command, or cancel it with `windbg_interrupt_target`.\n";
+    out += "4. Submit a new command only when ready_for_commands is true; use wait_for_completion=false to return without waiting.\n\n";
     out += `Total entries: ${this.len()}\n`;
     out += `Commands: ${commandCount}\n`;
     out += `Meta-commands: ${metaCount}\n`;
+    out += `Extension commands: ${extensionCount}\n`;
     out += "Session state tool: windbg_sessions\n";
     out += `Command page template: ${TEMPLATE_URI}\n\n`;
     return out;

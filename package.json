@@ -12,11 +12,16 @@
   "os": [
     "win32"
   ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "build": "tsc && node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
     "start": "node dist/index.js",
     "dev": "npm run build && node dist/index.js",
     "prepack": "npm run build"
