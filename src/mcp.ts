@@ -13,7 +13,7 @@ import {
 } from "./session.js";
 
 const SERVER_NAME = "windbg-mcp";
-const SERVER_VERSION = "0.2.0";
+const SERVER_VERSION = "0.3.0";
 const MAX_SESSIONS = 8;
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 const MUTATING = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };

@@ -89,6 +89,8 @@ npm test                # node --test tests/*.test.mjs; build first
 - `npm run dev` builds and then starts the server with Node; `prepack` also runs the build.
 - `npx -y windbg-mcp@latest` runs the published package with Node. Use `bun x --bun windbg-mcp@latest` to select the Bun runtime rather than follow the Node shebang.
 - No lint script is currently defined.
+- `.github/workflows/publish.yml` runs on Ubuntu when a `v*` tag is pushed and publishes the committed `package.json` version to npm `latest`, without running tests. Its `npm ci --force` bypasses the Windows-only runtime restriction for the build-only dependency installation.
+- Publishing uses npm Trusted Publishing for `kanren3/windbg-mcp`, workflow `publish.yml`, with no GitHub environment and direct `npm publish` enabled; no npm token secret is required.
 
 ## Code Conventions & Common Patterns
 
