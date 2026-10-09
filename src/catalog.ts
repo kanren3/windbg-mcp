@@ -14,8 +14,6 @@ import { readFileSync } from "node:fs";
 
 export type CatalogSection = "command" | "meta_command" | "extension";
 
-export type ToolRouting = "execute_command" | "interrupt_target" | "documentation_only";
-
 export interface CatalogEntry {
   id: string;
   section: CatalogSection;
@@ -27,6 +25,7 @@ export interface CatalogEntry {
   kernel_mode_syntax: string | null;
   documentation: string;
   source?: string;
+  compatibility_note?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -40,18 +39,43 @@ export const TEMPLATE_URI = "windbg://command/{id}";
 // Entry helpers
 // ---------------------------------------------------------------------------
 
-export function entryToolRouting(entry: CatalogEntry): ToolRouting {
-  if (entry.supports_text_execution) return "execute_command";
-  if (entry.tokens.some((t) => t.toUpperCase() === "CTRL+C")) return "interrupt_target";
-  return "documentation_only";
-}
+const LEARN_COMMAND_ROOT = "https://learn.microsoft.com/windows-hardware/drivers/debuggercmds/";
 
-export function entryRecommendedTool(entry: CatalogEntry): string | null {
-  switch (entryToolRouting(entry)) {
-    case "execute_command": return "windbg_execute_command";
-    case "interrupt_target": return "windbg_interrupt_target";
-    case "documentation_only": return null;
+/** Normalize links at catalog load, leaving stored/imported upstream bodies intact. */
+export function normalizeDocumentationLinks(documentation: string, source = LEARN_COMMAND_ROOT): string {
+  const absoluteLink = (target: string, image = false): string => {
+    // External URLs and page-local anchors already have the intended destination.
+    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(target)) return target;
+    const url = new URL(target, source);
+    if (!image && url.hostname === "learn.microsoft.com" &&
+        url.pathname.startsWith("/windows-hardware/drivers/")) {
+      url.pathname = url.pathname.replace(/\.md$/i, "");
+    }
+    return url.href;
+  };
+
+  // Links inside code are examples, not navigable documentation links.
+  const chunks = documentation.split(/(^[ \t]*(?:`{3,}|~{3,})[^\r\n]*\r?\n[\s\S]*?^[ \t]*(?:`{3,}|~{3,})[ \t]*(?=\r?$)|`+[^`\r\n]*`+)/gm);
+  for (let i = 0; i < chunks.length; i += 2) {
+    chunks[i] = chunks[i]
+      .replace(/(!?\[[^\]\r\n]*\]\(\s*)(<[^>\r\n]*>|[^\s)\r\n]+)/g,
+        (_match, prefix: string, destination: string) => {
+          const angled = destination.startsWith("<");
+          const target = angled ? destination.slice(1, -1) : destination;
+          const link = absoluteLink(target, prefix.startsWith("!"));
+          return prefix + (angled ? `<${link}>` : link);
+        })
+      .replace(/(<a\b[^>]*?\bhref\s*=\s*)(["'])([^"']*)\2/gi,
+        (_match, prefix: string, quote: string, target: string) =>
+          prefix + quote + absoluteLink(target) + quote)
+      .replace(/(<img\b[^>]*?\bsrc\s*=\s*)(["'])([^"']*)\2/gi,
+        (_match, prefix: string, quote: string, target: string) =>
+          prefix + quote + absoluteLink(target, true) + quote)
+      .replace(/(:::image\b[^\r\n]*?\bsource\s*=\s*)(["'])([^"']*)\2/gi,
+        (_match, prefix: string, quote: string, target: string) =>
+          prefix + quote + absoluteLink(target, true) + quote);
   }
+  return chunks.join("");
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +105,7 @@ export class Catalog {
     const entries = raw.map((e): CatalogEntry => ({
       ...e,
       section: e.section === "meta_command" || e.section === "extension" ? e.section : "command",
+      documentation: normalizeDocumentationLinks(e.documentation, e.source),
     }));
     Catalog.instance = new Catalog(entries);
     return Catalog.instance;
@@ -106,42 +131,44 @@ export class Catalog {
     if (!needle) return this.entries.slice(0, limit);
 
     const terms = needle.split(/\s+/).filter(Boolean);
-    const scored: { score: number; matched: number; entry: CatalogEntry }[] = [];
+    const scored: { tier: number; score: number; matched: number; entry: CatalogEntry }[] = [];
 
     for (const entry of this.entries) {
-      let score = 0;
-      let matched = 0;
-
-      // Exact id match
-      if (entry.id === needle) score += 1000;
-
-      // Token matches
+      // A complete identity match outranks every fuzzy result, regardless of
+      // how many aliases that result happens to have.
+      let tier = entry.id.toLowerCase() === needle ? 4 : 0;
+      let bestAlias = 0;
       for (const token of entry.tokens) {
-        const tl = token.toLowerCase();
-        if (tl === needle) score += 500;
-        else if (tl.startsWith(needle)) score += 200;
-        else if (tl.includes(needle)) score += 100;
+        const lower = token.toLowerCase();
+        if (lower === needle) { tier = Math.max(tier, 3); bestAlias = 500; }
+        else if (lower.startsWith(needle)) { tier = Math.max(tier, 2); bestAlias = Math.max(bestAlias, 200); }
+        else if (lower.includes(needle)) { tier = Math.max(tier, 1); bestAlias = Math.max(bestAlias, 100); }
       }
 
-      // Per-term matches
+      let score = bestAlias;
+      let matched = 0;
+      const title = entry.title.toLowerCase();
+      const summary = entry.summary.toLowerCase();
       for (const term of terms) {
-        let hit = false;
+        let bestTermAlias = 0;
         for (const token of entry.tokens) {
-          const tl = token.toLowerCase();
-          if (tl === term) { score += 50; hit = true; }
-          else if (tl.startsWith(term)) { score += 20; hit = true; }
-          else if (tl.includes(term)) { score += 10; hit = true; }
+          const lower = token.toLowerCase();
+          if (lower === term) bestTermAlias = Math.max(bestTermAlias, 50);
+          else if (lower.startsWith(term)) bestTermAlias = Math.max(bestTermAlias, 20);
+          else if (lower.includes(term)) bestTermAlias = Math.max(bestTermAlias, 10);
         }
-        if (entry.title.toLowerCase().includes(term)) { score += 15; hit = true; }
-        if (entry.summary.toLowerCase().includes(term)) { score += 5; hit = true; }
-        if (hit) matched++;
+        let termScore = bestTermAlias;
+        if (title.includes(term)) termScore += 15;
+        if (summary.includes(term)) termScore += 5;
+        score += termScore;
+        if (termScore > 0) matched++;
       }
 
-      if (score > 0) scored.push({ score, matched, entry });
+      if (tier > 0 || score > 0) scored.push({ tier, score, matched, entry });
     }
 
     scored.sort((a, b) =>
-      b.score - a.score || b.matched - a.matched || a.entry.id.localeCompare(b.entry.id),
+      b.tier - a.tier || b.score - a.score || b.matched - a.matched || a.entry.id.localeCompare(b.entry.id),
     );
     return scored.slice(0, limit).map((s) => s.entry);
   }
@@ -152,18 +179,11 @@ export class Catalog {
     const extensionCount = this.entries.filter((e) => e.section === "extension").length;
 
     let out = "";
-    out += "WinDbg MCP guide\n\n";
-    out += "Recommended flow:\n";
-    out += "1. Find a command with `windbg_search_commands`, then read `windbg://command/{id}` for its full documentation.\n";
-    out += "2. Call `windbg_sessions` to check the debugger state before execution.\n";
-    out += "3. Collect a pending command by calling `windbg_execute_command` without command, or cancel it with `windbg_interrupt_target`.\n";
-    out += "4. Submit a new command only when ready_for_commands is true; use wait_for_completion=false to return without waiting.\n\n";
+    out += "Catalog\n-------\n";
     out += `Total entries: ${this.len()}\n`;
     out += `Commands: ${commandCount}\n`;
     out += `Meta-commands: ${metaCount}\n`;
     out += `Extension commands: ${extensionCount}\n`;
-    out += "Session state tool: windbg_sessions\n";
-    out += `Command page template: ${TEMPLATE_URI}\n\n`;
     return out;
   }
 }

@@ -1,27 +1,9 @@
-/**
- * MCP server — JSON-RPC 2.0 dispatch over stdio.
- *
- * Implements the MCP 2026-07-28 protocol:
- * - `server/discover` (mandatory)
- * - `tools/list`, `tools/call`
- * - `resources/list`, `resources/templates/list`, `resources/read`
- * - Dual-era: also answers legacy `initialize` for backward compatibility.
- *
- * Tools (per user spec):
- * - windbg_open_executable  — cdb <exe> [args...], debuggee is a cdb child
- * - windbg_open_dump        — cdb -z <dump>
- * - windbg_close            — `q`: end debugging, debuggee terminated with it
- * - windbg_attach_process   — cdb -p <pid> | -pn <name>
- * - windbg_attach_kernel    — kd -k <connection>
- * - windbg_detach           — `qd`: end debugging, debuggee keeps running
- * - windbg_sessions         — enumerate sessions with type/target/state
- * - windbg_interrupt_target — CTRL+BREAK into the running target
- * - windbg_execute_command  — run any debugger command
- * - windbg_search_commands  — search the command catalog by keyword
- */
-
-import { Catalog } from "./catalog.js";
+import { McpServer, ResourceNotFoundError, ResourceTemplate, type CallToolResult } from "@modelcontextprotocol/server";
+import * as z from "zod/v4";
+import { Catalog, TEMPLATE_URI } from "./catalog.js";
 import { renderCommand, renderGuide, GUIDE_URI } from "./resources.js";
+import { DEFAULT_OUTPUT_PAGE_BYTES, MAX_OUTPUT_PAGE_BYTES } from "./command_output.js";
+import { MAX_COMMAND_LENGTH, MAX_COMMAND_LINE_LENGTH } from "./command_policy.js";
 import {
   type DebuggerSession,
   createCdbExecutableSession,
@@ -30,25 +12,11 @@ import {
   createKdSession,
 } from "./session.js";
 
-/** Discover-era protocol revision (server/discover). */
-const PROTOCOL_VERSION = "2026-07-28";
-/**
- * Newest revision mainstream SDKs support (@modelcontextprotocol/sdk
- * SUPPORTED_PROTOCOL_VERSIONS). Used as the initialize fallback so that
- * clients which predate the discover era can connect.
- */
-const LATEST_OFFICIAL_VERSION = "2025-11-25";
-const SUPPORTED_PROTOCOL_VERSIONS: readonly string[] = [
-  PROTOCOL_VERSION,
-  LATEST_OFFICIAL_VERSION,
-  "2025-06-18",
-  "2025-03-26",
-  "2024-11-05",
-  "2024-10-07",
-];
 const SERVER_NAME = "windbg-mcp";
 const SERVER_VERSION = "0.2.0";
-
+const MAX_SESSIONS = 8;
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const MUTATING = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true };
 const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and kd.exe (kernel).
 
 ## Choose a tool by task
@@ -58,7 +26,9 @@ const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and k
 - Debug a kernel target (VM, test machine) → windbg_attach_kernel with a connection string
 - Check debugger state → windbg_sessions (look for ready_for_commands=true)
 - Need a prompt while a command is pending → windbg_interrupt_target (also cancels dump commands)
-- Run a debugger command → windbg_execute_command; use wait_for_completion:false for g, and omit command to collect pending results
+- Run a debugger command → windbg_execute_command with an explicit session_id; CDB/KD determines applicability in the current context
+- Collect output → omit command; use command_id and next_output_offset to fetch subsequent pages before starting another command
+- Commands are not semantically filtered. Preserve debugger input and completion-marker output; timeouts do not confirm completion or cancel execution
 - Unsure of the exact command → windbg_search_commands with a keyword
 - End session, kill debuggee → windbg_close
 - End session, keep debuggee running → windbg_detach
@@ -72,10 +42,6 @@ const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and k
 - windbg://guide/overview — full workflow guide
 - windbg://command/{id} — full command documentation (several KB each; when the client supports subagents, run search + read + synthesis in a subagent to keep the main context lean)`;
 
-// ---------------------------------------------------------------------------
-// Session registry
-// ---------------------------------------------------------------------------
-
 interface SessionRecord {
   id: string;
   type: "executable" | "dump" | "process" | "kernel";
@@ -83,13 +49,13 @@ interface SessionRecord {
 }
 
 let sessionCounter = 0;
+let shuttingDown = false;
 const sessions = new Map<string, SessionRecord>();
-// Factories spawn synchronously, before start() has received the first prompt.
+// Factories spawn before start() has received the first prompt.
 const openingSessions = new Set<DebuggerSession>();
 
-/** Close every open session (kills kd/cdb children). Used on server exit. */
 export async function closeAllSessions(): Promise<void> {
-  // A session still opening cannot receive a safe debugger quit command yet.
+  shuttingDown = true;
   const opening = [...openingSessions];
   openingSessions.clear();
   for (const session of opening) {
@@ -97,13 +63,14 @@ export async function closeAllSessions(): Promise<void> {
   }
   await Promise.allSettled([...sessions.values()].map(async (rec) => {
     await rec.session.close();
+    if (rec.session.outputCleanupError) console.error("Temporary output cleanup:", rec.session.outputCleanupError);
     sessions.delete(rec.id);
   }));
-  // Failed closes stay registered for the synchronous exit fallback.
+  // Failed closes stay registered for forced termination during shutdown.
 }
 
-/** Synchronously kill every session's debugger child. Used from "exit" handler. */
 export function killAllSessionsSync(): void {
+  shuttingDown = true;
   const all = [...sessions.values()].map((rec) => rec.session).concat([...openingSessions]);
   openingSessions.clear();
   for (const session of all) {
@@ -112,706 +79,296 @@ export function killAllSessionsSync(): void {
   sessions.clear();
 }
 
-function genSessionId(): string {
-  sessionCounter++;
-  return sessionCounter.toString(16).padStart(8, "0");
+function discardExitedSessions(): void {
+  for (const [id, rec] of sessions) {
+    if (rec.session.exited) {
+      sessions.delete(id);
+      rec.session.killSync();
+    }
+  }
 }
 
+async function startSession(
+  create: () => DebuggerSession,
+  type: SessionRecord["type"],
+  target?: string,
+): Promise<CallToolResult> {
+  // SDK argument validation can finish after the transport has disconnected.
+  if (shuttingDown) throw new Error("Server is shutting down");
+  discardExitedSessions();
+  if (sessions.size + openingSessions.size >= MAX_SESSIONS) {
+    throw new Error(`Session limit reached (${MAX_SESSIONS}, including sessions still opening). Close or detach a session first.`);
+  }
+  const session = create();
+  openingSessions.add(session);
+  try {
+    await session.start();
+    const state = await session.queryState();
+    if (!openingSessions.has(session)) throw new Error("Server is shutting down");
+    const id = (++sessionCounter).toString(16).padStart(8, "0");
+    sessions.set(id, { id, type, session });
+    return toolResult({ session_id: id, kind: session.kind, type, target: target ?? session.target, state });
+  } catch (error) {
+    session.killSync();
+    throw error;
+  } finally {
+    openingSessions.delete(session);
+  }
+}
 
-// ---------------------------------------------------------------------------
-// Tool definitions
-// ---------------------------------------------------------------------------
+function requireSession(sessionId: string): SessionRecord {
+  if (shuttingDown) throw new Error("Server is shutting down");
+  discardExitedSessions();
+  const rec = sessions.get(sessionId);
+  if (!rec) throw new Error("No matching debug session. Use windbg_sessions to list open sessions.");
+  return rec;
+}
 
-const TOOLS = [
-  {
-    name: "windbg_open_executable",
+function toolResult(data: object, structured = false, isError = false): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(data) }],
+    isError,
+    ...(structured ? { structuredContent: data } : {}),
+  };
+}
+
+const nonEmptyString = z.string().regex(/\S/, "Must contain a non-whitespace character");
+const sessionIdSchema = nonEmptyString.describe("Required session id returned by an open/attach tool or windbg_sessions");
+const timeoutSchema = z.number().positive().optional().describe("Positive waiting budget in seconds (default 60); expiry does not cancel a command");
+const cdbPathSchema = z.string().optional().describe("Custom cdb.exe path (auto-detected if omitted)");
+const symbolsPathSchema = z.string().optional().describe("Symbol search path (-y)");
+const stateSchema = z.object({
+  raw_status: z.number().nullable(),
+  status_name: z.string(),
+  running: z.boolean().nullable().describe("Null when target execution state is unknown"),
+  busy: z.boolean(),
+  ready_for_commands: z.boolean(),
+  requires_interrupt_before_command: z.boolean(),
+  summary: z.string(),
+});
+
+export function createMcpServer(): McpServer {
+  const catalog = Catalog.load();
+  const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION }, {
+    instructions: SERVER_INSTRUCTIONS,
+    cacheHints: { "server/discover": { ttlMs: 3600000, cacheScope: "public" } },
+  });
+
+  server.registerTool("windbg_open_executable", {
     title: "Start and debug an executable",
-    description: "Launch a process under cdb.exe. Returns a session_id. The debuggee runs as a child of cdb; windbg_close terminates it, windbg_detach lets it keep running.\nAfter opening: set symbols with \".symfix\" + \".reload\", then run \"g\" with wait_for_completion:false to start execution or \"bp <symbol>\" to set breakpoints first.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        executable: { type: "string", description: "Path to the executable to debug" },
-        args: { type: "array", items: { type: "string" }, description: "Optional command-line arguments for the debuggee" },
-        cdb_path: { type: "string", description: "Custom cdb.exe path (auto-detected if omitted)" },
-        symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for the debugger to become ready (default 60)" },
-      },
-      required: ["executable"],
-    },
-  },
-  {
-    name: "windbg_open_dump",
+    description: "Launch a process under cdb.exe. Returns a session_id. windbg_close terminates the debuggee; windbg_detach lets it keep running. Set symbols with .symfix and .reload, then use g with wait_for_completion:false or set breakpoints first.",
+    annotations: MUTATING,
+    inputSchema: z.object({
+      executable: nonEmptyString.describe("Path to the executable to debug"),
+      args: z.array(z.string()).optional().describe("Command-line arguments for the debuggee"),
+      cdb_path: cdbPathSchema,
+      symbols_path: symbolsPathSchema,
+      timeout: timeoutSchema,
+    }),
+  }, (args) => startSession(() => createCdbExecutableSession(args.executable, args.args ?? [], {
+    cdbPath: args.cdb_path, symbolsPath: args.symbols_path, timeout: args.timeout,
+  }), "executable"));
+
+  server.registerTool("windbg_open_dump", {
     title: "Open a crash dump",
-    description: "Open a crash dump file (.dmp/.mdmp/.hdmp) for analysis. Returns a session_id. A dump is static: commands run immediately, no break-in needed.\nAfter opening: set symbols with \".symfix\" + \".reload\", then run \"!analyze -v\" for automated crash analysis.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        dump_path: { type: "string", description: "Path to the crash dump file" },
-        cdb_path: { type: "string", description: "Custom cdb.exe path" },
-        symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for the debugger to become ready (default 60)" },
-      },
-      required: ["dump_path"],
-    },
-  },
-  {
-    name: "windbg_close",
+    description: "Open a crash dump (.dmp/.mdmp/.hdmp) for analysis. Returns a session_id. Set symbols with .symfix and .reload, then run !analyze -v. The target is static, but a long debugger command can still be interrupted.",
+    annotations: { ...MUTATING, destructiveHint: false },
+    inputSchema: z.object({
+      dump_path: nonEmptyString.describe("Path to the crash dump file"),
+      cdb_path: cdbPathSchema,
+      symbols_path: symbolsPathSchema,
+      timeout: timeoutSchema,
+    }),
+  }, (args) => startSession(() => createCdbDumpSession(args.dump_path, {
+    cdbPath: args.cdb_path, symbolsPath: args.symbols_path, timeout: args.timeout,
+  }), "dump"));
+
+  server.registerTool("windbg_close", {
     title: "Close a debug session",
-    description: "End debugging by executing `q`. In user mode, `q` closes the target application whether it was launched (windbg_open_executable) or attached (windbg_attach_process). For kernel sessions, `q` ends the session but leaves the target locked. To detach and leave the target running, use windbg_detach (`qd`) instead.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        session_id: { type: "string", description: "Session id to close (closes the active session if omitted)" },
-      },
-    },
-  },
-  {
-    name: "windbg_attach_process",
-    title: "Attach to a running process",
-    description: "Attach cdb.exe to a running user-mode process by pid or name. Returns a session_id. The debugger breaks in at attach.\nAfter attaching: set symbols with \".symfix\" + \".reload\", then use \"kb\" for stack trace or \"dv\" for local variables. Use windbg_detach to leave the process running.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        pid: { type: "integer", minimum: 1, description: "Decimal process ID to attach to (-p)" },
-        name: { type: "string", description: "Process name to attach to (-pn), e.g. notepad.exe" },
-        cdb_path: { type: "string", description: "Custom cdb.exe path" },
-        symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for attach (default 60)" },
-      },
-      oneOf: [
-        { required: ["pid"] },
-        { required: ["name"] },
-      ],
-    },
-  },
-  {
-    name: "windbg_attach_kernel",
-    title: "Attach to a kernel target",
-    description: "Attach kd.exe to a kernel target. Returns a session_id. The target must be booted with debugging enabled.\nConnection strings: KDNET 'net:port=50000,key=1.2.3.4' (port is optional and defaults to 50000), named pipe 'com:pipe,port=\\\\.\\pipe\\com_1,baud=115200,reconnect,resets=0', serial 'com:port=COM1,baud=115200'.\nAfter connecting: set symbols with \".symfix\" + \".reload\", then use \"kb\" for stack trace or \"!process 0 0\" to list processes.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        kernel_connection: { type: "string", description: "Kernel connection string (-k)" },
-        kd_path: { type: "string", description: "Custom kd.exe path" },
-        symbols_path: { type: "string", description: "Symbol search path (-y)" },
-        timeout: { type: "number", exclusiveMinimum: 0, description: "Seconds to wait for the target to connect (default 60)" },
-      },
-      required: ["kernel_connection"],
-    },
-  },
-  {
-    name: "windbg_detach",
-    title: "Detach from a debug session",
-    description: "End debugging by executing `qd` (quit and detach). Detaches from the target and resumes it, leaving it running (NOT terminated, unlike `q`). Applies to live user-mode and kernel-mode targets, not crash dumps. Use this after attaching to a production process you must not kill.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        session_id: { type: "string", description: "Session id to detach (detaches the active session if omitted)" },
-      },
-    },
-  },
-  {
-    name: "windbg_sessions",
-    title: "List active debug sessions",
-    description: "List active sessions with their type, target and state. Submit a new command only when ready_for_commands is true. A busy session may be running a target or executing a debugger command; running:null means unknown. Omit command in windbg_execute_command to collect a pending result, or use windbg_interrupt_target to cancel it.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-    outputSchema: {
-      type: "object",
-      properties: {
-        sessions: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              session_id: { type: "string", description: "Unique session identifier" },
-              created_at: { type: "string", description: "ISO 8601 creation timestamp" },
-              type: { type: "string", description: "Session type (executable, dump, process, kernel)" },
-              kind: { type: "string", description: "Debugger kind (cdb or kd)" },
-              target: { type: "string", description: "Target description (path, pid, or connection string)" },
-              state: {
-                type: "object",
-                properties: {
-                  status_name: { type: "string" },
-                  ready_for_commands: { type: "boolean", description: "True if the debugger accepts commands" },
-                  running: { type: ["boolean", "null"], description: "Null when the text channel cannot distinguish a running target from a busy debugger" },
-                  busy: { type: "boolean" },
-                },
-              },
-            },
-            required: ["session_id", "type", "target", "state"],
-          },
-        },
-      },
-      required: ["sessions"],
-    },
-  },
-  {
-    name: "windbg_interrupt_target",
-    title: "Interrupt a target or debugger command",
-    description: "Send CTRL+BREAK and wait for a confirmed command prompt. Stops a running live target or cancels a debugger command, including commands in dump sessions. Reports an error if the interrupt fails; use windbg_execute_command without command to collect the pending command's output afterward.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        session_id: { type: "string", description: "Session id to interrupt (interrupts the active session if omitted)" },
-      },
-    },
-  },
-  {
-    name: "windbg_execute_command",
-    title: "Execute a debugger command",
-    description: "Execute any WinDbg/KD command string. A new command requires a debugger prompt. Omit command to collect the cumulative output of the most recent command without running it again. timeout is a waiting budget, not a command deadline: completed:false leaves the command running, without automatically interrupting it. Use wait_for_completion:false for \"g\", then interrupt when needed and collect results by omitting command.\nCommon commands: \"kb\" (stack trace), \"lm\" (loaded modules), \"dt <type>\" (display type), \"dv\" (local variables), \"r\" (registers), \"u <addr>\" (disassemble), \"d <addr>\" (display memory), \"bp <symbol>\" (set breakpoint), \"g\" (continue), \"!analyze -v\" (crash analysis), \".symfix\" + \".reload\" (set symbols).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        command: { type: "string", description: "New debugger command; omit to collect the most recent command's output without executing again" },
-        session_id: { type: "string", description: "Session id (uses the active session if omitted)" },
-        timeout: { type: "number", exclusiveMinimum: 0, description: "Positive waiting budget in seconds; unfinished commands continue after it expires" },
-        wait_for_completion: { type: "boolean", default: true, description: "Wait for completion within timeout; false returns an immediate cumulative output snapshot" },
-      },
-    },
-    outputSchema: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-        output: { type: "string", description: "Raw debugger output text" },
-        completed: { type: "boolean", description: "Whether the command has finished; false means output may still grow" },
-        state_before: { type: "object" },
-        state_after: { type: "object" },
-      },
-      required: ["command", "output", "completed"],
-    },
-  },
-  {
-    name: "windbg_search_commands",
-    title: "Search WinDbg command reference",
-    description: "Search the WinDbg/KD command catalog by keyword. Returns matching commands with summary and a resource URI for full documentation. Use when unsure of the exact command name.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Search query (e.g. 'breakpoint', 'stack trace', 'dt', '.sympath')" },
-        limit: { type: "integer", minimum: 1, description: "Max results to return (default 10)" },
-      },
-      required: ["query"],
-    },
-    outputSchema: {
-      type: "object",
-      properties: {
-        results: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              title: { type: "string" },
-              tokens: { type: "array", items: { type: "string" } },
-              summary: { type: "string" },
-              resource: { type: "string", description: "URI for full documentation" },
-            },
-            required: ["id", "title", "tokens", "summary"],
-          },
-        },
-      },
-      required: ["results"],
-    },
-  },
-] as const;
-
-// ---------------------------------------------------------------------------
-// MCP handler
-// ---------------------------------------------------------------------------
-
-export class McpServer {
-  private catalog: Catalog;
-
-  constructor() {
-    this.catalog = Catalog.load();
-  }
-
-  /** Validate the MCP envelope before deciding whether this is a notification. */
-  async handle(request: unknown): Promise<unknown> {
-    if (!isObject(request)) return jsonRpcError(null, -32600, "Invalid Request");
-    const hasId = Object.hasOwn(request, "id");
-    const { id, method, params } = request;
-    const validId = typeof id === "string" || (typeof id === "number" && Number.isInteger(id));
-    if (request.jsonrpc !== "2.0" || typeof method !== "string" ||
-        (hasId && !validId) || (Object.hasOwn(request, "params") && !isObject(params))) {
-      return jsonRpcError(validId ? id : null, -32600, "Invalid Request");
-    }
-    const isNotification = !hasId;
-
-    try {
-      let result: unknown;
-      switch (method) {
-        case "server/discover":
-          result = this.handleDiscover();
-          break;
-        case "initialize":
-          result = this.handleLegacyInitialize(params);
-          break;
-        case "tools/list":
-          result = this.handleToolsList();
-          break;
-        case "tools/call":
-          result = await this.handleToolsCall(params);
-          break;
-        case "resources/list":
-          result = this.handleResourcesList();
-          break;
-        case "resources/templates/list":
-          result = this.handleResourceTemplatesList();
-          break;
-        case "resources/read":
-          result = this.handleResourcesRead(params);
-          break;
-        case "ping":
-          result = { resultType: "complete" };
-          break;
-        default:
-          throw new RpcError(-32601, `Method not found: ${method}`);
-      }
-      return isNotification ? null : { jsonrpc: "2.0", id, result };
-    } catch (err) {
-      if (isNotification) return null;
-      return jsonRpcError(id, err instanceof RpcError ? err.code : -32603, errMsg(err));
-    }
-  }
-
-  // -- Discovery -----------------------------------------------------------
-
-  private handleDiscover(): unknown {
-    return {
-      resultType: "complete",
-      supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
-      capabilities: {
-        tools: { listChanged: true },
-        resources: {},
-      },
-      _meta: {
-        "io.modelcontextprotocol/serverInfo": {
-          name: SERVER_NAME,
-          version: SERVER_VERSION,
-        },
-      },
-      instructions: SERVER_INSTRUCTIONS,
-      ttlMs: 3600000,
-      cacheScope: "public",
-    };
-  }
-
-  private handleLegacyInitialize(params: unknown): unknown {
-    if (!isObject(params) || typeof params.protocolVersion !== "string" ||
-        !isObject(params.capabilities) || !isObject(params.clientInfo) ||
-        typeof params.clientInfo.name !== "string" || typeof params.clientInfo.version !== "string") {
-      throw new RpcError(-32602, "initialize requires protocolVersion, capabilities and clientInfo");
-    }
-    // Version negotiation: echo the client's requested version when we
-    // support it (spec: server MUST respond with the same version); fall
-    // back to the newest version mainstream SDKs recognize otherwise.
-    const requested = params.protocolVersion;
-    const negotiated = SUPPORTED_PROTOCOL_VERSIONS.includes(requested)
-      ? requested
-      : LATEST_OFFICIAL_VERSION;
-    return {
-      protocolVersion: negotiated,
-      capabilities: {
-        tools: { listChanged: true },
-        resources: {},
-      },
-      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-      instructions: SERVER_INSTRUCTIONS,
-    };
-  }
-
-  // -- Tools --------------------------------------------------------------
-
-  private handleToolsList(): unknown {
-    return {
-      tools: TOOLS.map((t) => ({
-        name: t.name,
-        title: t.title,
-        description: t.description,
-        inputSchema: t.inputSchema,
-        ...("outputSchema" in t ? { outputSchema: t.outputSchema } : {}),
-      })),
-    };
-  }
-
-  private async handleToolsCall(params: unknown): Promise<unknown> {
-    if (!isObject(params) || typeof params.name !== "string" || !params.name ||
-        (Object.hasOwn(params, "arguments") && !isObject(params.arguments))) {
-      throw new RpcError(-32602, "tools/call requires a tool name and object arguments");
-    }
-    const name = params.name;
-    if (!TOOLS.some((tool) => tool.name === name)) {
-      throw new RpcError(-32602, `Unknown tool: ${name}`);
-    }
-    const args = (params.arguments ?? {}) as Record<string, unknown>;
-    const invalid = validateToolArguments(name, args);
-    if (invalid) return toolError(invalid);
-
-    try {
-      switch (name) {
-        case "windbg_open_executable": return await this.toolOpenExecutable(args);
-        case "windbg_open_dump": return await this.toolOpenDump(args);
-        case "windbg_close": return await this.toolClose(args);
-        case "windbg_attach_process": return await this.toolAttachProcess(args);
-        case "windbg_attach_kernel": return await this.toolAttachKernel(args);
-        case "windbg_detach": return await this.toolDetach(args);
-        case "windbg_sessions": return await this.toolSessions(args);
-        case "windbg_interrupt_target": return await this.toolInterruptTarget(args);
-        case "windbg_execute_command": return await this.toolExecuteCommand(args);
-        case "windbg_search_commands": return this.toolSearchCommands(args);
-      }
-    } catch (err) {
-      // Runtime debugger failures belong to the tool result, not JSON-RPC.
-      return toolError(errMsg(err));
-    }
-  }
-
-  private async startSession(session: DebuggerSession, type: SessionRecord["type"], target: string): Promise<unknown> {
-    openingSessions.add(session);
-    try {
-      await session.start();
-      const state = await session.queryState();
-      if (!openingSessions.has(session)) throw new Error("Server is shutting down");
-      const id = genSessionId();
-      sessions.set(id, { id, type, session });
-      return toolResult({ session_id: id, kind: session.kind, type, target, state });
-    } catch (err) {
-      session.killSync();
-      throw err;
-    } finally {
-      openingSessions.delete(session);
-    }
-  }
-
-  private async toolOpenExecutable(args: Record<string, unknown>): Promise<unknown> {
-    const executable = args.executable as string;
-    const execArgs = (args.args ?? []) as string[];
-    try {
-      const session = createCdbExecutableSession(executable, execArgs, {
-        cdbPath: strOrUndefined(args.cdb_path),
-        symbolsPath: strOrUndefined(args.symbols_path),
-        timeout: numOrUndefined(args.timeout),
-      });
-      return await this.startSession(session, "executable", executable);
-    } catch (e) {
-      return toolError(`Failed to start debug session: ${errMsg(e)}`);
-    }
-  }
-
-  private async toolOpenDump(args: Record<string, unknown>): Promise<unknown> {
-    const dumpPath = args.dump_path as string;
-    try {
-      const session = createCdbDumpSession(dumpPath, {
-        cdbPath: strOrUndefined(args.cdb_path),
-        symbolsPath: strOrUndefined(args.symbols_path),
-        timeout: numOrUndefined(args.timeout),
-      });
-      return await this.startSession(session, "dump", dumpPath);
-    } catch (e) {
-      return toolError(`Failed to open dump: ${errMsg(e)}`);
-    }
-  }
-
-  private async toolClose(args: Record<string, unknown>): Promise<unknown> {
-    const rec = resolveSession(args.session_id);
-    if (!rec) return toolError("No matching debug session. Use windbg_sessions to list open sessions.");
+    description: "Close the debugger process: request q, then force termination if cooperative shutdown fails. Closing a user-mode debugger can terminate its targets. Use windbg_detach when the debugger must detach rather than be forcibly terminated.",
+    annotations: MUTATING,
+    inputSchema: z.object({ session_id: sessionIdSchema }),
+  }, async ({ session_id }) => {
+    const rec = requireSession(session_id);
     await rec.session.close();
     sessions.delete(rec.id);
-    return toolResult({ closed: rec.id, type: rec.type, target: rec.session.target });
-  }
+    return toolResult({
+      closed: rec.id, type: rec.type, target: rec.session.target,
+      ...(rec.session.outputCleanupError ? { output_cleanup_error: rec.session.outputCleanupError } : {}),
+    });
+  });
 
-  private async toolAttachProcess(args: Record<string, unknown>): Promise<unknown> {
-    const pid = typeof args.pid === "number" ? String(args.pid) : undefined;
-    const name = typeof args.name === "string" && args.name ? args.name : undefined;
-    const attachSpec = pid ?? name!;
-    try {
-      const session = createCdbAttachSession(attachSpec, {
-        cdbPath: strOrUndefined(args.cdb_path),
-        symbolsPath: strOrUndefined(args.symbols_path),
-        timeout: numOrUndefined(args.timeout),
-      });
-      return await this.startSession(session, "process", session.target);
-    } catch (e) {
-      return toolError(`Failed to attach to process: ${errMsg(e)}`);
-    }
-  }
+  server.registerTool("windbg_attach_process", {
+    title: "Attach to a running process",
+    description: "Attach cdb.exe to a running user-mode process by pid or name, but not both. Returns a session_id and breaks into the target. Set symbols, then use kb or dv. Use windbg_detach to leave the process running.",
+    annotations: MUTATING,
+    inputSchema: z.object({
+      pid: z.number().int().positive().optional().describe("Decimal process ID (-p)"),
+      name: nonEmptyString.optional().describe("Process name (-pn), e.g. notepad.exe"),
+      cdb_path: cdbPathSchema,
+      symbols_path: symbolsPathSchema,
+      timeout: timeoutSchema,
+    }).refine((args) => (args.pid !== undefined) !== (args.name !== undefined), {
+      message: "Provide exactly one of pid or name",
+    }),
+  }, (args) => startSession(() => createCdbAttachSession(args.pid === undefined ? args.name! : String(args.pid), {
+    cdbPath: args.cdb_path, symbolsPath: args.symbols_path, timeout: args.timeout,
+  }), "process"));
 
-  private async toolAttachKernel(args: Record<string, unknown>): Promise<unknown> {
-    const kernel = args.kernel_connection as string;
-    try {
-      const session = createKdSession(kernel, {
-        kdPath: strOrUndefined(args.kd_path),
-        symbolsPath: strOrUndefined(args.symbols_path),
-        timeout: numOrUndefined(args.timeout),
-      });
-      return await this.startSession(session, "kernel", kernel);
-    } catch (e) {
-      return toolError(`Failed to connect to kernel target: ${errMsg(e)}`);
-    }
-  }
+  server.registerTool("windbg_attach_kernel", {
+    title: "Attach to a kernel target",
+    description: "Attach kd.exe to a target booted with debugging enabled. Returns a session_id. Connections: net:port=50000,key=1.2.3.4 (port defaults to 50000), com:pipe,port=\\\\.\\pipe\\com_1,baud=115200,reconnect,resets=0, or com:port=COM1,baud=115200. Set symbols, then use kb or !process 0 0.",
+    annotations: MUTATING,
+    inputSchema: z.object({
+      kernel_connection: nonEmptyString.describe("Kernel connection string (-k)"),
+      kd_path: z.string().optional().describe("Custom kd.exe path (auto-detected if omitted)"),
+      symbols_path: symbolsPathSchema,
+      timeout: timeoutSchema,
+    }),
+  }, (args) => startSession(() => createKdSession(args.kernel_connection, {
+    kdPath: args.kd_path, symbolsPath: args.symbols_path, timeout: args.timeout,
+  }), "kernel", args.kernel_connection));
 
-  private async toolDetach(args: Record<string, unknown>): Promise<unknown> {
-    const rec = resolveSession(args.session_id);
-    if (!rec) return toolError("No matching debug session. Use windbg_sessions to list open sessions.");
+  server.registerTool("windbg_detach", {
+    title: "Detach from a debug session",
+    description: "Send qd (quit and detach) to the current debugger context and wait for debugger exit. Intended to leave live user-mode or kernel-mode targets running. CDB/KD determines applicability; an unsuccessful detach leaves the session available for recovery.",
+    annotations: { ...MUTATING, destructiveHint: false },
+    inputSchema: z.object({ session_id: sessionIdSchema }),
+  }, async ({ session_id }) => {
+    const rec = requireSession(session_id);
     await rec.session.detach();
     sessions.delete(rec.id);
-    return toolResult({ detached: rec.id, type: rec.type, target: rec.session.target });
-  }
+    return toolResult({
+      detached: rec.id, type: rec.type, target: rec.session.target,
+      ...(rec.session.outputCleanupError ? { output_cleanup_error: rec.session.outputCleanupError } : {}),
+    });
+  });
 
-  private async toolSessions(args: Record<string, unknown>): Promise<unknown> {
-    void args;
-    const list: unknown[] = [];
+  server.registerTool("windbg_sessions", {
+    title: "List active debug sessions",
+    description: "List sessions with their initial type and target, plus current debugger readiness. Commands may change targets; type and target are not a live target inventory. A new command requires ready_for_commands=true. Busy does not imply a running target; running:null means unknown. Collect output with windbg_execute_command without command, or interrupt with windbg_interrupt_target.",
+    annotations: READ_ONLY,
+    inputSchema: z.object({}),
+    outputSchema: z.object({
+      sessions: z.array(z.object({
+        session_id: z.string(),
+        created_at: z.string(),
+        type: z.enum(["executable", "dump", "process", "kernel"]).describe("How the session was initially opened"),
+        kind: z.enum(["cdb", "kd"]),
+        target: z.string().describe("Initial target description; commands may change the active targets"),
+        state: stateSchema,
+      })),
+    }),
+  }, async () => {
+    discardExitedSessions();
+    const list = [];
     for (const rec of sessions.values()) {
-      const state = await rec.session.queryState();
       list.push({
         session_id: rec.id,
         created_at: new Date(rec.session.createdAt).toISOString(),
         type: rec.type,
         kind: rec.session.kind,
         target: rec.session.target,
-        state,
+        state: await rec.session.queryState(),
       });
     }
-    return toolResult({ sessions: list }, { sessions: list });
-  }
+    return toolResult({ sessions: list }, true);
+  });
 
-  private async toolInterruptTarget(args: Record<string, unknown>): Promise<unknown> {
-    const rec = resolveSession(args.session_id);
-    if (!rec) return toolError("No matching debug session. Use windbg_sessions to list open sessions.");
-    const state = await rec.session.interrupt();
-    return toolResult({ session_id: rec.id, state });
-  }
+  server.registerTool("windbg_interrupt_target", {
+    title: "Interrupt a target or debugger command",
+    description: "Send CTRL+BREAK and wait for a confirmed command prompt. Stops a live target or cancels a debugger command, including dump commands. On failure the session remains available for recovery. Collect command output afterward with windbg_execute_command without command.",
+    annotations: MUTATING,
+    inputSchema: z.object({ session_id: sessionIdSchema }),
+  }, async ({ session_id }) => {
+    const rec = requireSession(session_id);
+    return toolResult({ session_id: rec.id, state: await rec.session.interrupt() });
+  });
 
-  private async toolExecuteCommand(args: Record<string, unknown>): Promise<unknown> {
-    const command = strOrUndefined(args.command);
-    const rec = resolveSession(args.session_id);
-    if (!rec) return toolError("No matching debug session. Use windbg_sessions to list open sessions.");
+  server.registerTool("windbg_execute_command", {
+    title: "Execute a debugger command",
+    description: "Send debugger command text to CDB/KD without semantic filtering, or omit command to collect captured output. The debugger determines applicability and reports command errors in its output. Results are paginated UTF-8 text: use command_id and next_output_offset while has_more_output is true. Drain pages before starting another command, which expires previous output. completed:true means the private completion marker was observed; timeout does not cancel execution. Use wait_for_completion:false for g. Commands, scripts and extensions must preserve debugger input and completion-marker output. A debugger exit before the marker or an output storage failure is reported as a tool error. Lifecycle tools are convenient alternatives, not mandatory command routes.",
+    annotations: MUTATING,
+    inputSchema: z.object({
+      command: nonEmptyString.max(MAX_COMMAND_LENGTH).regex(/^[\x09\x0a\x0d\x20-\x7e]+$/, "Use ASCII debugger command text; Unicode paths belong in tool parameters").optional().describe(`ASCII command text, up to ${MAX_COMMAND_LENGTH} characters and ${MAX_COMMAND_LINE_LENGTH} per line; blank lines are ignored. Omit to collect output.`),
+      session_id: sessionIdSchema,
+      timeout: timeoutSchema,
+      wait_for_completion: z.boolean().default(true).describe("Wait within timeout; false returns an immediate cumulative snapshot"),
+      command_id: nonEmptyString.optional().describe("Output identity returned by execute; required when continuing a page"),
+      output_offset: z.number().int().nonnegative().optional().describe("UTF-8 byte offset from next_output_offset; collect calls only"),
+      max_output_bytes: z.number().int().min(4).max(MAX_OUTPUT_PAGE_BYTES).optional().describe(`Page byte budget (default ${DEFAULT_OUTPUT_PAGE_BYTES}, maximum ${MAX_OUTPUT_PAGE_BYTES})`),
+    }),
+    outputSchema: z.object({
+      command: z.string(),
+      command_id: z.string(),
+      output: z.string(),
+      output_offset: z.number().int().nonnegative(),
+      next_output_offset: z.number().int().nonnegative(),
+      total_output_bytes: z.number().int().nonnegative(),
+      has_more_output: z.boolean(),
+      output_error: z.string().optional(),
+      completed: z.boolean(),
+      state_before: stateSchema,
+      state_after: stateSchema,
+    }),
+  }, async ({ session_id, command, timeout, wait_for_completion, command_id, output_offset, max_output_bytes }) => {
+    const rec = requireSession(session_id);
+    try {
+      const result = await rec.session.execute(command, timeout, wait_for_completion, { command_id, output_offset, max_output_bytes });
+      return toolResult(result, true, result.output_error !== undefined);
+    } finally {
+      if (rec.session.exited) {
+        sessions.delete(rec.id);
+        rec.session.killSync();
+      }
+    }
+  });
 
-    const timeout = numOrUndefined(args.timeout);
-    const result = await rec.session.execute(command, timeout, (args.wait_for_completion as boolean | undefined) ?? true);
-    const payload = {
-      command: result.command,
-      output: result.output,
-      completed: result.completed,
-      state_before: result.state_before,
-      state_after: result.state_after,
-    };
-    return toolResult(payload, payload);
-  }
-
-  private toolSearchCommands(args: Record<string, unknown>): unknown {
-    const query = (args.query as string).trim();
-    const limit = numOrUndefined(args.limit) ?? 10;
-    const results = this.catalog.search(query, limit).map((entry) => ({
+  server.registerTool("windbg_search_commands", {
+    title: "Search WinDbg command reference",
+    description: "Search the WinDbg/KD command catalog by keyword. Returns commands with summaries and resource URIs for the full documentation.",
+    annotations: READ_ONLY,
+    inputSchema: z.object({
+      query: nonEmptyString.describe("Search query, e.g. breakpoint, stack trace, dt or .sympath"),
+      limit: z.number().int().positive().optional().describe("Maximum results (default 10)"),
+    }),
+    outputSchema: z.object({
+      results: z.array(z.object({
+        id: z.string(),
+        title: z.string(),
+        tokens: z.array(z.string()),
+        summary: z.string(),
+        resource: z.string(),
+      })),
+    }),
+  }, ({ query, limit }) => {
+    const results = catalog.search(query.trim(), limit ?? 10).map((entry) => ({
       id: entry.id,
       title: entry.title,
       tokens: entry.tokens,
       summary: entry.summary,
       resource: `windbg://command/${entry.id}`,
     }));
-    return toolResult({ results }, { results });
-  }
+    return toolResult({ results }, true);
+  });
 
-  // -- Resources ----------------------------------------------------------
+  server.registerResource("windbg guide", GUIDE_URI, {
+    title: "WinDbg MCP guide",
+    description: "Workflow for mapping debugger requests to tools and command resources",
+    mimeType: "text/plain",
+  }, (uri) => ({
+    contents: [{ uri: uri.href, mimeType: "text/plain", text: renderGuide(catalog) }],
+  }));
 
-  private handleResourcesList(): unknown {
-    const guide = renderGuide(this.catalog);
-    return {
-      resources: [
-        {
-          uri: GUIDE_URI,
-          name: "windbg guide",
-          title: "WinDbg MCP guide",
-          description: "Workflow for mapping debugger requests to tools and command resources",
-          mimeType: "text/plain",
-          size: guide.length,
-        },
-      ],
-    };
-  }
+  server.registerResource("windbg command page", new ResourceTemplate(TEMPLATE_URI, { list: undefined }), {
+    title: "WinDbg command page",
+    description: "Full debugger command topic by catalog id",
+    mimeType: "text/plain",
+  }, (uri) => {
+    const entry = catalog.resolveResourceUri(uri.href);
+    if (!entry) throw new ResourceNotFoundError(uri.href);
+    return { contents: [{ uri: uri.href, mimeType: "text/plain", text: renderCommand(entry) }] };
+  });
 
-  private handleResourceTemplatesList(): unknown {
-    return {
-      resourceTemplates: [
-        {
-          uriTemplate: "windbg://command/{id}",
-          name: "windbg command page",
-          title: "WinDbg command page",
-          description: "Full extracted debugger command topic by catalog id",
-          mimeType: "text/plain",
-        },
-      ],
-    };
-  }
-
-  private handleResourcesRead(params: unknown): unknown {
-    if (!isObject(params) || typeof params.uri !== "string" || !params.uri) {
-      throw new RpcError(-32602, "resources/read requires a string uri");
-    }
-    const uri = params.uri;
-    try { new URL(uri); }
-    catch { throw new RpcError(-32602, "Invalid resource URI"); }
-
-    if (uri === GUIDE_URI) {
-      return {
-        contents: [{ uri, mimeType: "text/plain", text: renderGuide(this.catalog) }],
-      };
-    }
-
-    const resolved = this.catalog.resolveResourceUri(uri);
-    if (!resolved) {
-      throw new RpcError(-32002, `Unknown resource: ${uri}`);
-    }
-
-    const content = renderCommand(resolved);
-
-    return {
-      contents: [{ uri, mimeType: "text/plain", text: content }],
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-class RpcError extends Error {
-  constructor(readonly code: number, message: string) {
-    super(message);
-  }
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function validateToolArguments(name: string, args: Record<string, unknown>): string | undefined {
-  let strings: readonly string[] = [];
-  let required: readonly string[] = [];
-  let acceptsTimeout = false;
-  switch (name) {
-    case "windbg_open_executable":
-      strings = ["executable", "cdb_path", "symbols_path"];
-      required = ["executable"];
-      acceptsTimeout = true;
-      if (Object.hasOwn(args, "args") &&
-          (!Array.isArray(args.args) || !args.args.every((arg) => typeof arg === "string"))) {
-        return "Invalid argument: args must be an array of strings";
-      }
-      break;
-    case "windbg_open_dump":
-      strings = ["dump_path", "cdb_path", "symbols_path"];
-      required = ["dump_path"];
-      acceptsTimeout = true;
-      break;
-    case "windbg_attach_process":
-      strings = ["name", "cdb_path", "symbols_path"];
-      acceptsTimeout = true;
-      if (Object.hasOwn(args, "pid") === Object.hasOwn(args, "name")) {
-        return "Provide exactly one of pid or name";
-      }
-      if (Object.hasOwn(args, "pid") &&
-          (typeof args.pid !== "number" || !Number.isInteger(args.pid) || args.pid <= 0)) {
-        return "Invalid argument: pid must be a positive integer";
-      }
-      if (Object.hasOwn(args, "name")) required = ["name"];
-      break;
-    case "windbg_attach_kernel":
-      strings = ["kernel_connection", "kd_path", "symbols_path"];
-      required = ["kernel_connection"];
-      acceptsTimeout = true;
-      break;
-    case "windbg_close":
-    case "windbg_detach":
-    case "windbg_interrupt_target":
-      strings = ["session_id"];
-      break;
-    case "windbg_execute_command":
-      strings = ["session_id", "command"];
-      acceptsTimeout = true;
-      if (Object.hasOwn(args, "wait_for_completion") && typeof args.wait_for_completion !== "boolean") {
-        return "Invalid argument: wait_for_completion must be a boolean";
-      }
-      break;
-    case "windbg_search_commands":
-      strings = ["query"];
-      required = ["query"];
-      if (Object.hasOwn(args, "limit") &&
-          (typeof args.limit !== "number" || !Number.isInteger(args.limit) || args.limit <= 0)) {
-        return "Invalid argument: limit must be a positive integer";
-      }
-      break;
-  }
-  for (const key of strings) {
-    if (Object.hasOwn(args, key) && typeof args[key] !== "string") {
-      return `Invalid argument: ${key} must be a string`;
-    }
-  }
-  for (const key of required) {
-    const value = args[key];
-    if (typeof value !== "string" || !value.trim()) {
-      return `Missing required non-empty string argument: ${key}`;
-    }
-  }
-  for (const key of ["session_id", "command"]) {
-    if (strings.includes(key) && Object.hasOwn(args, key) && !(args[key] as string).trim()) {
-      return `Invalid argument: ${key} must not be empty`;
-    }
-  }
-  if (acceptsTimeout && Object.hasOwn(args, "timeout") &&
-      (typeof args.timeout !== "number" || !Number.isFinite(args.timeout) || args.timeout <= 0)) {
-    return "Invalid argument: timeout must be a positive finite number";
-  }
-  return undefined;
-}
-
-function resolveSession(sessionId: unknown): SessionRecord | null {
-  if (sessionId !== undefined) {
-    return typeof sessionId === "string" && sessionId ? sessions.get(sessionId) ?? null : null;
-  }
-  // No session_id → the most recently opened session.
-  let last: SessionRecord | null = null;
-  for (const rec of sessions.values()) last = rec;
-  return last;
-}
-
-function strOrUndefined(value: unknown): string | undefined {
-  return typeof value === "string" && value ? value : undefined;
-}
-
-function numOrUndefined(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-function jsonRpcError(id: unknown, code: number, message: string): unknown {
-  return { jsonrpc: "2.0", id, error: { code, message } };
-}
-
-/** Tool result as structured text content (isError=false). */
-function toolResult(data: unknown, structured?: unknown): unknown {
-  const result: Record<string, unknown> = {
-    content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-    isError: false,
-  };
-  if (structured !== undefined) {
-    result.structuredContent = structured;
-  }
-  return result;
-}
-
-/** Tool error as text content (isError=true). */
-function toolError(message: string): unknown {
-  return {
-    content: [{ type: "text", text: message }],
-    isError: true,
-  };
+  return server;
 }

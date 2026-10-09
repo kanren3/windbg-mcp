@@ -1,5 +1,7 @@
 // Import explicit extension-reference pages without regenerating the existing
 // standard/meta-command catalog. Run: node scripts/import-extensions.mjs <debuggercmds-dir>
+// Keep upstream bodies and source URLs intact: Catalog.load is the single,
+// idempotent link-normalization boundary for retained and newly imported pages.
 import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
@@ -75,7 +77,7 @@ for (const file of files) {
 }
 if (!extensions.length) throw new Error("No explicit extension-command pages found");
 
-// Preserve the existing entry order, field values, and file newline convention.
+// Preserve upstream bodies, existing entry order, and file newline convention.
 const newline = original.includes("\r\n") ? "\r\n" : "\n";
 writeFileSync(catalogPath, (JSON.stringify([...retained, ...extensions], null, 2) + "\n").replaceAll("\n", newline));
 const tokenCounts = new Map();

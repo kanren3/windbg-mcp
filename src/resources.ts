@@ -2,15 +2,10 @@
  * Resource rendering — the workflow guide and the full command page.
  *
  * The guide teaches the low-context workflow; the command page renders a
- * single catalog entry with its routing guidance and complete documentation.
+ * single catalog entry with its complete documentation.
  */
 
-import {
-  type Catalog,
-  type CatalogEntry,
-  entryRecommendedTool,
-  entryToolRouting,
-} from "./catalog.js";
+import type { Catalog, CatalogEntry } from "./catalog.js";
 
 export const GUIDE_URI = "windbg://guide/overview";
 
@@ -21,10 +16,13 @@ export function renderGuide(catalog: Catalog): string {
   out += "Workflow\n";
   out += "--------\n";
   out += "1. Open a session: `windbg_open_executable` (start a process), `windbg_open_dump` (crash dump), `windbg_attach_process` (pid/name), or `windbg_attach_kernel` (KDNET/pipe/serial).\n";
-  out += "2. Check `windbg_sessions` before submitting a new command. `ready_for_commands=true` means a prompt was confirmed; `running=null` means the target's execution state is unknown.\n";
-  out += "3. Use `windbg_execute_command` with `wait_for_completion=false` for commands such as `g`. A wait timeout returns `completed=false` and leaves the command pending. Omit `command` to collect its cumulative output without executing it again.\n";
+  out += "2. Pass the returned session_id to every session operation. Check windbg_sessions before a new command: ready_for_commands=true means a confirmed prompt; running=null means unknown. Session type and target describe how the session was opened, not subsequent debugger target changes. At most eight sessions may be open or opening.\n";
+  out += "3. Use `windbg_execute_command` with `wait_for_completion=false` for commands such as `g`. A wait timeout returns `completed=false` and leaves the command pending. Omit `command` to collect its paginated output; use the returned command_id and next_output_offset to read further pages. Output is backed by a temporary file with an explicit disk quota, not silently truncated.\n";
   out += "4. Call `windbg_interrupt_target` to stop a running target or cancel a debugger command, including dump analysis. It waits for a confirmed command prompt.\n";
-  out += "5. End a session with `windbg_close` (`q`; in user mode this closes the target application) or `windbg_detach` (`qd`; detaches and leaves the target running — live user-mode or kernel-mode targets, not dumps).\n\n";
+  out += "5. End a session with `windbg_close` (requests q, then forces debugger termination if needed) or `windbg_detach` (sends qd and waits for exit without force-killing on failure). Detach is intended to leave live targets running; CDB/KD decides whether it applies to the current context.\n\n";
+  out += "Commands are passed to CDB/KD without semantic filtering. The debugger determines their applicability in the current context, including target changes, scripts and aliases. The lifecycle tools are convenient session operations, not mandatory command routes.\n";
+  out += "Completion is confirmed by a private .printf marker. Commands, scripts and extensions must leave debugger input available and preserve marker output. Taking over input or changing output settings can prevent completion confirmation; a timeout does not prove failure or cancel execution. A debugger exit before the marker is reported as a tool error and the exited session is removed.\n\n";
+  out += "Redirected debugger command text is ASCII-only because affected CDB readers can misinterpret multibyte input as console controls. Use tool parameters for Unicode paths. Requests allow 65536 characters total and 4094 per line; blank lines do not repeat commands.\n\n";
 
   out += "Command reference\n";
   out += "-----------------\n";
@@ -58,22 +56,9 @@ export function renderCommand(entry: CatalogEntry): string {
   out += `Tokens: ${entry.tokens.join(", ")}\n`;
   out += `Summary: ${entry.summary}\n`;
   if (entry.source) out += `Source: ${entry.source}\n`;
-  out += `Tool Route: ${entryToolRouting(entry)}\n`;
-
-  const rec = entryRecommendedTool(entry);
-  out += rec ? `Recommended Tool: ${rec}\n` : "Recommended Tool: documentation only\n";
-
-  out += "\nNext Step\n---------\n";
-  switch (entryToolRouting(entry)) {
-    case "execute_command":
-      out += "Confirm ready_for_commands before submitting a new command. Use wait_for_completion=false for execution-control commands; omit command on later calls to collect a pending result. To cancel it, use windbg_interrupt_target.\n";
-      break;
-    case "interrupt_target":
-      out += "This topic maps to an engine-level break action. Use `windbg_interrupt_target` instead of `windbg_execute_command`.\n";
-      break;
-    case "documentation_only":
-      out += "This topic is documentation-only in MCP because it describes a UI shortcut or non-text action.\n";
-      break;
+  if (entry.compatibility_note) {
+    out += "\nRuntime Compatibility (MCP)\n---------------------------\n";
+    out += entry.compatibility_note + "\n";
   }
 
   out += "\nDocumentation\n-------------\n";

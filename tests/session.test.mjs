@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -9,13 +9,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 const options = { skip: process.platform !== 'win32', timeout: 30000 };
 let sessions;
 
-async function openSession(t) {
+async function openSession(t, { maxOutputBytes, executable = process.execPath, execArgs = ['-e', 'setInterval(() => {}, 1000)'] } = {}) {
   sessions ??= await import('../dist/session.js');
   let session;
   try {
-    session = sessions.createCdbExecutableSession(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    session = sessions.createCdbExecutableSession(executable, execArgs, {
       symbolsPath: process.env.SystemRoot,
       timeout: 10,
+      maxOutputBytes,
     });
   } catch (error) {
     if (error.message.includes('Could not find cdb.exe')) {
@@ -235,7 +236,7 @@ test('interrupt bypasses a pending synchronous execute', options, async (t) => {
   const session = await openSession(t);
   if (!session) return;
   const waiting = session.execute('g');
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await delay(200);
   const interrupted = await session.interrupt();
   assert.equal(interrupted.ready_for_commands, true);
   assert.equal((await waiting).completed, true);
@@ -246,8 +247,7 @@ test('a successor cannot start while the native interrupt call is still in fligh
   if (!session) return;
   const nativeProcess = session.process;
   const sendCtrlBreak = nativeProcess.sendCtrlBreak.bind(nativeProcess);
-  let release;
-  const held = new Promise((resolve) => { release = resolve; });
+  const { promise: held, resolve: release } = Promise.withResolvers();
   nativeProcess.sendCtrlBreak = async () => {
     const sent = await sendCtrlBreak();
     await held;
@@ -353,7 +353,7 @@ test('failed interrupt and detach leave a live target and pending command intact
   assert.match(result.stdout, /target-preserved/);
 });
 
-test('dump commands are cancellable and never reported as a running target', options, async (t) => {
+test('dump commands remain cancellable without inferring target execution state', options, async (t) => {
   const source = await openSession(t);
   if (!source) return;
   const directory = mkdtempSync(join(tmpdir(), 'windbg-mcp-test-'));
@@ -369,13 +369,232 @@ test('dump commands are cancellable and never reported as a running target', opt
   await dump.start();
   const pending = await dump.execute('.echo LOOP_STARTED\n.while (1) { .sleep 0n10 }', undefined, false);
   assert.equal(pending.completed, false);
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await delay(200);
   const state = await dump.queryState();
   assert.equal(state.busy, true);
-  assert.equal(state.running, false);
+  assert.equal(state.running, null);
   assert.equal((await dump.interrupt()).ready_for_commands, true);
   const result = await dump.execute();
   assert.equal(result.completed, true);
   assert.match(result.output, /LOOP_STARTED/);
   await dump.close();
+});
+
+test('invalid redirected input leaves CDB and the previous command intact', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  const pid = await targetPid(session);
+  t.after(() => stopTarget(pid));
+  const commands = [
+    '', ' \t\r\n',
+    '.echo BEFORE_CONTROL\n\u0002',
+    '.echo ' + 'X'.repeat(4089),
+    '.echo ' + '中'.repeat(1024),
+  ];
+  let previous = await session.execute('.printf "POLICY_READY"');
+  for (const command of commands) {
+    await assert.rejects(session.execute(command), Error, command);
+    const collected = await session.execute();
+    assert.equal(collected.command_id, previous.command_id, command);
+    assert.equal(collected.output, previous.output, command);
+    assert.equal(collected.completed, true, command);
+    assert.equal((await session.queryState()).ready_for_commands, true, command);
+    assert.equal(session.exited, false, command);
+    process.kill(pid, 0);
+    previous = await session.execute('.printf "POLICY_READY"');
+    assert.equal(previous.output, 'POLICY_READY', command);
+    assert.equal(previous.completed, true, command);
+  }
+  assert.equal(await targetPid(session), pid);
+});
+
+test('quoted text, ordinary multiline loops, and noninteractive shells remain usable', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  assert.equal((await session.execute('~0s')).completed, true);
+  const literal = 'q .create .outmask';
+  const quoted = await session.execute(`.printf "${literal}"`);
+  assert.equal(quoted.completed, true);
+  assert.equal(quoted.output, literal);
+  const multiline = await session.execute(
+    `.printf "BEGIN|"\n.for (r $t0=0; @$t0<3; r $t0=@$t0+1) { .printf "${literal}|" }\n.printf "END"`,
+  );
+  assert.equal(multiline.completed, true);
+  assert.equal(multiline.output, `BEGIN|${`${literal}|`.repeat(3)}END`);
+  const shell = await session.execute('.shell -i- cmd.exe /c echo NONINTERACTIVE_SHELL_WITNESS');
+  assert.equal(shell.completed, true);
+  assert.match(shell.output, /NONINTERACTIVE_SHELL_WITNESS/);
+  assert.equal(shell.state_after.ready_for_commands, true);
+  assert.equal(session.exited, false);
+  assert.equal((await session.execute('.printf "AFTER_SHELL"')).output, 'AFTER_SHELL');
+});
+
+test('CDB launch preserves TAB, empty, quote, and trailing-backslash arguments in an owned Node target', options, async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'windbg-mcp-argv-'));
+  let session;
+  let pid;
+  t.after(() => {
+    session?.killSync();
+    if (pid !== undefined) stopTarget(pid);
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+  const node = spawnSync('node', ['-p', 'process.execPath'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(node.status, 0, node.stderr || node.error?.message);
+  const script = join(directory, 'record-argv.cjs');
+  const record = join(directory, 'argv.json');
+  writeFileSync(script, `
+    const { renameSync, writeFileSync } = require('node:fs');
+    const temporary = process.argv[2] + '.tmp';
+    writeFileSync(temporary, JSON.stringify({ pid: process.pid, argv: process.argv.slice(3) }));
+    renameSync(temporary, process.argv[2]);
+    setInterval(() => {}, 1000);
+  `);
+  const argv = ['tab\tseparated', '', 'embedded"quote', 'slash\\"quote', 'path with spaces\\', 'plain\\', ''];
+  session = await openSession(t, { executable: node.stdout.trim(), execArgs: [script, record, ...argv] });
+  if (!session) return;
+  pid = await targetPid(session);
+  assert.equal((await session.execute('g', undefined, false)).completed, false);
+  const deadline = Date.now() + 5000;
+  while (!existsSync(record) && Date.now() < deadline) await delay(25);
+  assert.equal(existsSync(record), true, 'owned target must record its actual argv');
+  const witness = JSON.parse(readFileSync(record, 'utf8'));
+  assert.equal(witness.pid, pid);
+  assert.deepEqual(witness.argv, argv);
+  process.kill(pid, 0);
+  assert.equal((await session.interrupt()).ready_for_commands, true);
+  assert.equal((await session.execute()).completed, true);
+  await session.close();
+});
+
+test('command pagination reconstructs real CDB output with stable identity and refuses stale cursors', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  const count = 9000;
+  const expected = Array.from({ length: count }, (_, index) => `PAGE${String(index).padStart(4, '0')}|`).join('');
+  const totalBytes = Buffer.byteLength(expected, 'utf8');
+  const command = `.for (r $t0=0; @$t0<0n${count}; r $t0=@$t0+1) { .printf "PAGE%04d|", @$t0 }`;
+  const first = await session.execute(command, 20);
+  assert.equal(first.completed, true);
+  assert.equal(first.has_more_output, true);
+  assert.equal(first.output_offset, 0);
+  assert.ok(first.command_id.length > 0);
+  const chunks = [];
+  let offset = 0;
+  let page = first;
+  do {
+    assert.equal(page.command_id, first.command_id);
+    assert.equal(page.command, command);
+    assert.equal(page.completed, true);
+    assert.equal(page.output_error, undefined);
+    assert.equal(page.output_offset, offset);
+    assert.equal(page.total_output_bytes, totalBytes);
+    const pageBytes = Buffer.byteLength(page.output, 'utf8');
+    assert.ok(pageBytes > 0 && pageBytes <= (page === first ? 65536 : 4096));
+    assert.equal(page.next_output_offset, offset + pageBytes);
+    assert.equal(page.has_more_output, page.next_output_offset < totalBytes);
+    chunks.push(page.output);
+    offset = page.next_output_offset;
+    if (!page.has_more_output) break;
+    page = await session.execute(undefined, undefined, true, {
+      command_id: first.command_id, output_offset: offset, max_output_bytes: 4096,
+    });
+  } while (true);
+  assert.equal(chunks.join(''), expected);
+  assert.equal(offset, totalBytes);
+  const end = await session.execute(undefined, undefined, true, {
+    command_id: first.command_id, output_offset: offset, max_output_bytes: 4096,
+  });
+  assert.equal(end.command_id, first.command_id);
+  assert.equal(end.output, '');
+  assert.equal(end.output_offset, totalBytes);
+  assert.equal(end.next_output_offset, totalBytes);
+  assert.equal(end.total_output_bytes, totalBytes);
+  assert.equal(end.has_more_output, false);
+  const next = await session.execute('.printf "NEW_COMMAND_OUTPUT"');
+  assert.notEqual(next.command_id, first.command_id);
+  for (const staleOffset of [0, first.next_output_offset]) {
+    await assert.rejects(session.execute(undefined, undefined, true, {
+      command_id: first.command_id, output_offset: staleOffset, max_output_bytes: 4096,
+    }), Error);
+  }
+  const current = await session.execute(undefined, undefined, true, { command_id: next.command_id });
+  assert.equal(current.command_id, next.command_id);
+  assert.equal(current.output, 'NEW_COMMAND_OUTPUT');
+});
+
+test('a low output quota reports capture failure without blocking interruption, completion, or later commands', options, async (t) => {
+  const maxOutputBytes = 1024;
+  const session = await openSession(t, { maxOutputBytes });
+  if (!session) return;
+  const payload = 'QUOTA_OUTPUT_'.repeat(16);
+  const started = await session.execute(`.while (1) { .printf "${payload}"; .sleep 0n10 }`, undefined, false);
+  assert.equal(started.completed, false);
+  let failed;
+  const deadline = Date.now() + 5000;
+  do {
+    await delay(25);
+    failed = await session.execute(undefined, undefined, false, { command_id: started.command_id });
+  } while (failed.output_error === undefined && Date.now() < deadline);
+  assert.equal(typeof failed.output_error, 'string');
+  assert.equal(failed.completed, false);
+  assert.equal(failed.command_id, started.command_id);
+  assert.ok(failed.total_output_bytes <= maxOutputBytes);
+  assert.equal(Buffer.byteLength(failed.output, 'utf8'), failed.total_output_bytes);
+  assert.equal(failed.has_more_output, false);
+  assert.equal(session.exited, false);
+  assert.equal((await session.queryState()).ready_for_commands, false);
+  assert.equal((await session.interrupt()).ready_for_commands, true);
+  const interrupted = await session.execute(undefined, undefined, true, { command_id: started.command_id });
+  assert.equal(interrupted.completed, true);
+  assert.equal(interrupted.output_error, failed.output_error);
+  assert.equal(interrupted.output, failed.output);
+  assert.equal(interrupted.total_output_bytes, failed.total_output_bytes);
+  const recovered = await session.execute('.printf "AFTER_QUOTA_INTERRUPT"');
+  assert.equal(recovered.completed, true);
+  assert.equal(recovered.output_error, undefined);
+  assert.equal(recovered.output, 'AFTER_QUOTA_INTERRUPT');
+  const finite = await session.execute(`.for (r $t0=0; @$t0<0n64; r $t0=@$t0+1) { .printf "${payload}" }`);
+  assert.equal(finite.completed, true);
+  assert.equal(typeof finite.output_error, 'string');
+  assert.ok(finite.total_output_bytes <= maxOutputBytes);
+  assert.equal(Buffer.byteLength(finite.output, 'utf8'), finite.total_output_bytes);
+  assert.equal(finite.state_after.ready_for_commands, true);
+  assert.equal(session.exited, false);
+  const final = await session.execute('.printf "AFTER_QUOTA_COMPLETION"');
+  assert.equal(final.completed, true);
+  assert.equal(final.output_error, undefined);
+  assert.equal(final.output, 'AFTER_QUOTA_COMPLETION');
+});
+
+test('temporary-file cleanup failures do not misreport successful detachment', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  const pid = await targetPid(session);
+  t.after(() => stopTarget(pid));
+  const captured = await session.execute('.echo CLEANUP_WITNESS');
+  const name = readdirSync(tmpdir()).find((entry) => entry.startsWith(`windbg-mcp-output-${captured.command_id}-`));
+  assert.equal(typeof name, 'string');
+  const directory = join(tmpdir(), name);
+  t.after(() => rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const preserved = join(directory, 'separate-file.txt');
+  writeFileSync(preserved, 'preserve this file');
+  await session.execute('g', undefined, false);
+  await session.detach();
+  assert.equal(session.exited, true);
+  assert.equal(typeof session.outputCleanupError, 'string');
+  process.kill(pid, 0);
+  assert.equal(readFileSync(preserved, 'utf8'), 'preserve this file');
+});
+
+test('blank lines and a trailing newline do not repeat debugger commands', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  const result = await session.execute(' \r\n.echo FIRST\n\n.echo SECOND\r\n\t\n');
+  assert.equal(result.completed, true);
+  assert.equal(result.output, 'FIRST\nSECOND');
+  const boundary = await session.execute('.echo ' + 'X'.repeat(4088));
+  assert.equal(boundary.completed, true);
+  assert.equal(boundary.output, 'X'.repeat(4088));
+  await assert.rejects(session.execute('.echo ' + 'X'.repeat(4089)), Error);
+  assert.equal((await session.execute('.echo AFTER_LINE_LIMIT')).output, 'AFTER_LINE_LIMIT');
 });

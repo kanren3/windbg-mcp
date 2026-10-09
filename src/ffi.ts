@@ -1,5 +1,18 @@
+/** Explicitly owned, nonmoving native storage; free only after native I/O completes. */
+export interface PinnedBuffer {
+  buffer: ArrayBuffer;
+  free(): void;
+}
+
 export interface Kernel32Ffi {
   createPipe(readBuf: ArrayBuffer, writeBuf: ArrayBuffer, sa: ArrayBuffer, size: number): boolean;
+  createNamedPipeW(name: ArrayBuffer, openMode: number, pipeMode: number, instances: number, outSize: number, inSize: number, timeout: number): bigint;
+  createFileW(name: ArrayBuffer, access: number, share: number, sa: ArrayBuffer, disposition: number, flags: number): bigint;
+  connectNamedPipe(handle: bigint, overlapped: ArrayBuffer): boolean;
+  createEventW(): bigint;
+  allocatePinnedBuffer(size: number): PinnedBuffer;
+  getOverlappedResult(handle: bigint, overlapped: ArrayBuffer, bytesBuf: ArrayBuffer): boolean;
+  cancelIoEx(handle: bigint, overlapped: ArrayBuffer): boolean;
   setHandleInformation(handle: bigint, mask: number, flags: number): boolean;
   createProcessW(
     appName: null, commandLine: ArrayBuffer, processAttrs: null, threadAttrs: null,
@@ -8,7 +21,7 @@ export interface Kernel32Ffi {
   ): boolean;
   closeHandle(handle: bigint): boolean;
   readFile(handle: bigint, buf: ArrayBuffer, count: number, bytesBuf: ArrayBuffer, overlapped: null): boolean;
-  writeFile(handle: bigint, buf: Uint8Array, count: number, bytesBuf: ArrayBuffer, overlapped: null): boolean;
+  writeFile(handle: bigint, buf: Uint8Array, count: number, bytesBuf: ArrayBuffer | null, overlapped: ArrayBuffer | null): boolean;
   getLastError(): number;
   generateConsoleCtrlEvent(event: number, processGroupId: number): boolean;
   terminateProcess(handle: bigint, exitCode: number): boolean;
