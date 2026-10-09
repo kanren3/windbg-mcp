@@ -45,12 +45,13 @@ stdin (JSON-RPC lines)
 
 ### Session state model
 
-`DebuggerSession` infers readiness from debugger-process liveness, reader errors, lifecycle flags, pending markers, and prompt observations; it does not query DbgEng execution status.
+`DebuggerSession` reports a current `state` string describing debugger-process liveness and command-channel readiness; it does not query or emulate DbgEng execution status. Readiness uses reader errors, lifecycle flags, pending markers and prompt observations.
 
-1. An exited debugger process reports `no_debuggee`.
-2. A live session with a confirmed prompt, no pending marker, no reader error, and no ending operation reports `break` and `ready_for_commands=true`.
-3. A pending command reports `busy`; this does not establish whether a target is running. Unknown target execution state is represented by `running: null` and `raw_status: null`.
-4. Session type and target describe the initial opening operation. Commands can change targets, so initial dump/live metadata is not used to infer current execution state or reject lifecycle operations.
+1. An exited debugger process reports `exited`; an ending operation reports `closing`.
+2. A live session with a confirmed prompt, no pending marker, no reader error and no ending operation reports `ready`.
+3. A pending command reports `busy`; unconfirmed readiness or reader errors report `unavailable`, with I/O failure details in `error`.
+4. Session type and target describe the initial opening operation. Commands can change targets, so initial dump/live metadata is not used to infer target execution state or reject lifecycle operations.
+5. Command results expose current `state`, not before/after snapshots. A collection pins its captured command's output while reporting current channel state, which may reflect a successor command.
 
 ### Marker protocol
 
@@ -61,7 +62,7 @@ Startup clears debugger aliases and disables prompt output with `.outmask- /l 0x
 - Session operations require `session_id`; the process admits at most eight open/opening sessions.
 - Redirected debugger command text is ASCII-only, up to 65536 characters per request and 4094 per physical line. Normalize line endings and ignore blank lines; an empty CDB console line repeats its previous command. Unicode paths use the existing wide-character tool parameters.
 - Output pages default to 64 KiB, can be 4–256 KiB, and each command has a 256 MiB temporary-storage quota. `output_error` is an explicit capture failure, not successful truncation.
-- Native commands, scripts, aliases and callbacks are not semantically filtered. Completion requires observing the private marker; output/input changes can leave it unconfirmed. Exiting before a marker is a tool error and releases the session. Explicit close requests q and force-terminates if necessary; detach waits for qd without force-killing on failure.
+- Native commands, scripts, aliases and callbacks are not semantically filtered. Completion requires observing the private marker; output/input changes can leave it unconfirmed. An observed debugger exit returns `state: "exited"` and captured output, with `completed: false` when no marker was observed; it does not imply command success. I/O and output storage failures remain tool errors. Exit removes the session and output storage, so its final response is the last available page. Explicit close requests q and force-terminates if necessary; detach waits for qd without force-killing on failure.
 - Kernel `qd` support is retained based on verified project behavior; preserve that compatibility note separately from the upstream reference.
 - Input views passed to native `writeStdin` must remain unchanged until the promise settles. An idle write is submitted before a following interrupt can overtake it.
 - Normal command replacement/session closure removes output files. Forced exit during pending filesystem callbacks can leave temporary output directories; do not claim hard-exit cleanup is guaranteed.

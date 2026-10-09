@@ -24,7 +24,7 @@ const SERVER_INSTRUCTIONS = `WinDbg MCP server: drives cdb.exe (user mode) and k
 - Debug a running process → windbg_attach_process (by pid or name)
 - Start a new process under the debugger → windbg_open_executable
 - Debug a kernel target (VM, test machine) → windbg_attach_kernel with a connection string
-- Check debugger state → windbg_sessions (look for ready_for_commands=true)
+- Check debugger state → windbg_sessions (look for state="ready")
 - Need a prompt while a command is pending → windbg_interrupt_target (also cancels dump commands)
 - Run a debugger command → windbg_execute_command with an explicit session_id; CDB/KD determines applicability in the current context
 - Collect output → omit command; use command_id and next_output_offset to fetch subsequent pages before starting another command
@@ -107,7 +107,7 @@ async function startSession(
     if (!openingSessions.has(session)) throw new Error("Server is shutting down");
     const id = (++sessionCounter).toString(16).padStart(8, "0");
     sessions.set(id, { id, type, session });
-    return toolResult({ session_id: id, kind: session.kind, type, target: target ?? session.target, state });
+    return toolResult({ session_id: id, kind: session.kind, type, target: target ?? session.target, ...state });
   } catch (error) {
     session.killSync();
     throw error;
@@ -137,15 +137,8 @@ const sessionIdSchema = nonEmptyString.describe("Required session id returned by
 const timeoutSchema = z.number().positive().optional().describe("Positive waiting budget in seconds (default 60); expiry does not cancel a command");
 const cdbPathSchema = z.string().optional().describe("Custom cdb.exe path (auto-detected if omitted)");
 const symbolsPathSchema = z.string().optional().describe("Symbol search path (-y)");
-const stateSchema = z.object({
-  raw_status: z.number().nullable(),
-  status_name: z.string(),
-  running: z.boolean().nullable().describe("Null when target execution state is unknown"),
-  busy: z.boolean(),
-  ready_for_commands: z.boolean(),
-  requires_interrupt_before_command: z.boolean(),
-  summary: z.string(),
-});
+const stateSchema = z.enum(["ready", "busy", "unavailable", "closing", "exited"])
+  .describe("Debugger process and command-channel state, not target execution state");
 
 export function createMcpServer(): McpServer {
   const catalog = Catalog.load();
@@ -246,7 +239,7 @@ export function createMcpServer(): McpServer {
 
   server.registerTool("windbg_sessions", {
     title: "List active debug sessions",
-    description: "List sessions with their initial type and target, plus current debugger readiness. Commands may change targets; type and target are not a live target inventory. A new command requires ready_for_commands=true. Busy does not imply a running target; running:null means unknown. Collect output with windbg_execute_command without command, or interrupt with windbg_interrupt_target.",
+    description: "List active sessions with their initial type and target, plus current debugger process and command-channel state. Commands may change targets; type and target are not a live target inventory. A new command requires state=ready. Busy means a command is pending, not that the target is running. Unavailable means readiness is unconfirmed or I/O failed; error carries I/O details. Exited debuggers are removed from this list. Collect output with windbg_execute_command without command, or interrupt with windbg_interrupt_target.",
     annotations: READ_ONLY,
     inputSchema: z.object({}),
     outputSchema: z.object({
@@ -257,6 +250,7 @@ export function createMcpServer(): McpServer {
         kind: z.enum(["cdb", "kd"]),
         target: z.string().describe("Initial target description; commands may change the active targets"),
         state: stateSchema,
+        error: z.string().optional(),
       })),
     }),
   }, async () => {
@@ -269,7 +263,7 @@ export function createMcpServer(): McpServer {
         type: rec.type,
         kind: rec.session.kind,
         target: rec.session.target,
-        state: await rec.session.queryState(),
+        ...await rec.session.queryState(),
       });
     }
     return toolResult({ sessions: list }, true);
@@ -282,12 +276,12 @@ export function createMcpServer(): McpServer {
     inputSchema: z.object({ session_id: sessionIdSchema }),
   }, async ({ session_id }) => {
     const rec = requireSession(session_id);
-    return toolResult({ session_id: rec.id, state: await rec.session.interrupt() });
+    return toolResult({ session_id: rec.id, ...await rec.session.interrupt() });
   });
 
   server.registerTool("windbg_execute_command", {
     title: "Execute a debugger command",
-    description: "Send debugger command text to CDB/KD without semantic filtering, or omit command to collect captured output. The debugger determines applicability and reports command errors in its output. Results are paginated UTF-8 text: use command_id and next_output_offset while has_more_output is true. Drain pages before starting another command, which expires previous output. completed:true means the private completion marker was observed; timeout does not cancel execution. Use wait_for_completion:false for g. Commands, scripts and extensions must preserve debugger input and completion-marker output. A debugger exit before the marker or an output storage failure is reported as a tool error. Lifecycle tools are convenient alternatives, not mandatory command routes.",
+    description: "Send debugger command text to CDB/KD without semantic filtering, or omit command to collect captured output. The debugger determines applicability and reports command errors in its output. Results are paginated UTF-8 text: use command_id and next_output_offset while has_more_output is true. Drain pages before starting another command, which expires previous output. completed:true means the private completion marker was observed; timeout does not cancel execution. state reports the current debugger process and command channel. An observed debugger exit returns state=exited and captured output; it does not imply command success. Exit removes the session and its output, so the final response is the last available page. I/O and output storage failures remain tool errors. Use wait_for_completion:false for g. Commands, scripts and extensions must preserve debugger input and completion-marker output. Lifecycle tools are convenient alternatives, not mandatory command routes.",
     annotations: MUTATING,
     inputSchema: z.object({
       command: nonEmptyString.max(MAX_COMMAND_LENGTH).regex(/^[\x09\x0a\x0d\x20-\x7e]+$/, "Use ASCII debugger command text; Unicode paths belong in tool parameters").optional().describe(`ASCII command text, up to ${MAX_COMMAND_LENGTH} characters and ${MAX_COMMAND_LINE_LENGTH} per line; blank lines are ignored. Omit to collect output.`),
@@ -308,14 +302,14 @@ export function createMcpServer(): McpServer {
       has_more_output: z.boolean(),
       output_error: z.string().optional(),
       completed: z.boolean(),
-      state_before: stateSchema,
-      state_after: stateSchema,
+      state: stateSchema,
+      error: z.string().optional(),
     }),
   }, async ({ session_id, command, timeout, wait_for_completion, command_id, output_offset, max_output_bytes }) => {
     const rec = requireSession(session_id);
     try {
       const result = await rec.session.execute(command, timeout, wait_for_completion, { command_id, output_offset, max_output_bytes });
-      return toolResult(result, true, result.output_error !== undefined);
+      return toolResult(result, true, result.error !== undefined || result.output_error !== undefined);
     } finally {
       if (rec.session.exited) {
         sessions.delete(rec.id);

@@ -163,7 +163,7 @@ test("ping, a different session, and interrupt stay responsive during a pending 
   }
   const intact = payload(await transport.call("windbg_sessions"));
   assert.deepEqual(intact.sessions.map((session) => session.session_id), [first.session_id, second.session_id]);
-  assert.ok(intact.sessions.every((session) => session.state.ready_for_commands));
+  assert.ok(intact.sessions.every((session) => session.state === "ready"));
   // Omitting command before any execution is an actual tool runtime failure.
   const noHistory = await transport.call("windbg_execute_command", { session_id: first.session_id });
   assert.equal(noHistory.isError, true);
@@ -221,7 +221,7 @@ test("ping, a different session, and interrupt stay responsive during a pending 
   }));
   assert.equal(budgetExpired.command, "g");
   assert.equal(budgetExpired.completed, false);
-  assert.equal(budgetExpired.state_after.ready_for_commands, false);
+  assert.equal(budgetExpired.state, "busy");
   payload(await transport.call("windbg_interrupt_target", { session_id: first.session_id }, 3000));
   const finished = payload(await transport.call("windbg_execute_command", {
     session_id: first.session_id, timeout: 2,
@@ -260,15 +260,15 @@ test("one stdin batch keeps idle interrupt, g, and its interrupt distinct", {
     } },
   ].map((message) => JSON.stringify(message)).join("\n") + "\n");
   const [idle, run, stop] = await Promise.all(responses);
-  assert.equal(payload(idle.result).state.ready_for_commands, true);
-  assert.equal(payload(stop.result).state.ready_for_commands, true);
+  assert.equal(payload(idle.result).state, "ready");
+  assert.equal(payload(stop.result).state, "ready");
   assert.equal(payload(run.result).completed, true);
   const collected = payload(await transport.call("windbg_execute_command", {
     session_id, wait_for_completion: false,
   }));
   assert.equal(collected.command, "g");
   assert.equal(collected.completed, true);
-  assert.equal(collected.state_after.ready_for_commands, true);
+  assert.equal(collected.state, "ready");
   payload(await transport.call("windbg_close", { session_id }));
 });
 

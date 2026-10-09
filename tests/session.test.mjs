@@ -114,19 +114,31 @@ test('concurrent commands in one session keep their results separate', options, 
   assert.equal(second.output, 'SECOND_RESULT');
 });
 
-test('collect keeps the command captured before a queued successor starts', options, async (t) => {
+test('collect pins earlier output while reporting the current busy channel', options, async (t) => {
   const session = await openSession(t);
   if (!session) return;
-  const first = session.execute('.echo FIRST_CAPTURED\n.sleep 0n300');
-  const second = session.execute('.echo SECOND_CAPTURED');
-  const collected = session.execute();
-  const [firstResult, secondResult, collectedResult] = await Promise.all([first, second, collected]);
-  assert.equal(collectedResult.command, firstResult.command);
-  assert.equal(collectedResult.output, firstResult.output);
-  assert.equal(collectedResult.completed, true);
-  assert.equal(collectedResult.state_after.ready_for_commands, true);
-  assert.equal(secondResult.output, 'SECOND_CAPTURED');
-  assert.doesNotMatch(collectedResult.output, /SECOND_CAPTURED/);
+  const first = await session.execute('.echo FIRST_CAPTURED');
+  const output = session._lastCommand.output;
+  const readPage = output.readPage.bind(output);
+  const { promise: held, resolve: release } = Promise.withResolvers();
+  output.readPage = async (...args) => { await held; return readPage(...args); };
+  t.after(release);
+  const collected = session.execute(undefined, undefined, false);
+  void collected.catch(() => {});
+  try {
+    const second = await session.execute('g', undefined, false);
+    assert.equal(second.state, 'busy');
+    release();
+    const result = await collected;
+    assert.equal(result.command_id, first.command_id);
+    assert.equal(result.output, first.output);
+    assert.equal(result.completed, true);
+    assert.equal(result.state, 'busy');
+    await session.interrupt();
+    assert.equal((await session.execute()).command_id, second.command_id);
+  } finally {
+    release();
+  }
 });
 
 test('nonwaiting collect returns while the original wait remains pending', options, async (t) => {
@@ -220,12 +232,10 @@ test('wait expiry preserves a running command until explicit interruption', opti
   const result = await session.execute('g', 0.05);
   assert.equal(result.completed, false);
   const state = await session.queryState();
-  assert.equal(state.ready_for_commands, false);
-  assert.equal(state.raw_status, null);
-  assert.equal(state.running, null);
+  assert.equal(state.state, 'busy');
   await assert.rejects(session.execute('r'), Error);
   const interrupted = await session.interrupt();
-  assert.equal(interrupted.ready_for_commands, true);
+  assert.equal(interrupted.state, 'ready');
   const collected = await session.execute();
   assert.equal(collected.command, 'g');
   assert.equal(collected.completed, true);
@@ -238,7 +248,7 @@ test('interrupt bypasses a pending synchronous execute', options, async (t) => {
   const waiting = session.execute('g');
   await delay(200);
   const interrupted = await session.interrupt();
-  assert.equal(interrupted.ready_for_commands, true);
+  assert.equal(interrupted.state, 'ready');
   assert.equal((await waiting).completed, true);
 });
 
@@ -264,7 +274,7 @@ test('a successor cannot start while the native interrupt call is still in fligh
   release();
   assert.equal(duringHelper.command, 'g');
   assert.equal(duringHelper.completed, true);
-  assert.equal((await stop).ready_for_commands, true);
+  assert.equal((await stop).state, 'ready');
   await successor;
   const afterHelper = await session.execute();
   assert.equal(afterHelper.command, '.echo AFTER_INTERRUPT_HELPER');
@@ -280,7 +290,7 @@ test('an immediate interrupt after an awaited command applies to the new command
   const waiting = session.execute('g', 1);
   await session.interrupt();
   assert.equal((await waiting).completed, true);
-  assert.equal((await session.queryState()).ready_for_commands, true);
+  assert.equal((await session.queryState()).state, 'ready');
 });
 
 test('an idle interrupt cannot mask a subsequent command interrupt', options, async (t) => {
@@ -290,10 +300,10 @@ test('an idle interrupt cannot mask a subsequent command interrupt', options, as
   const waiting = session.execute('g', 1);
   const stop = session.interrupt();
   assert.notEqual(idle, stop);
-  assert.equal((await idle).ready_for_commands, true);
-  assert.equal((await stop).ready_for_commands, true);
+  assert.equal((await idle).state, 'ready');
+  assert.equal((await stop).state, 'ready');
   assert.equal((await waiting).completed, true);
-  assert.equal((await session.queryState()).ready_for_commands, true);
+  assert.equal((await session.queryState()).state, 'ready');
 });
 
 test('detach from a running target waits for qd and preserves the target', options, async (t) => {
@@ -302,12 +312,37 @@ test('detach from a running target waits for qd and preserves the target', optio
   const pid = await targetPid(session);
   t.after(() => stopTarget(pid));
   assert.equal((await session.execute('g', undefined, false)).completed, false);
-  await session.detach();
+  const detaching = session.detach();
+  assert.equal((await session.queryState()).state, 'closing');
+  await detaching;
   process.kill(pid, 0);
   assert.equal(session.exited, true);
   const state = await session.queryState();
-  assert.equal(state.ready_for_commands, false);
-  assert.equal(state.requires_interrupt_before_command, false);
+  assert.equal(state.state, 'exited');
+});
+
+test('native quit reports exit separately from marker completion and retains final output', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  const result = await session.execute('.printf "EXIT_WITNESS"\nq');
+  assert.equal(result.state, 'exited');
+  assert.equal(result.completed, false);
+  assert.match(result.output, /EXIT_WITNESS/);
+  assert.equal((await session.queryState()).state, 'exited');
+  await assert.rejects(session.execute('r'), Error);
+});
+
+test('collect after debugger termination reports exit rather than the completed command state', options, async (t) => {
+  const session = await openSession(t);
+  if (!session) return;
+  const first = await session.execute('.printf "CAPTURED_BEFORE_EXIT"');
+  assert.equal(first.state, 'ready');
+  session.process.kill();
+  const result = await session.execute();
+  assert.equal(result.command_id, first.command_id);
+  assert.equal(result.output, 'CAPTURED_BEFORE_EXIT');
+  assert.equal(result.completed, true);
+  assert.equal(result.state, 'exited');
 });
 
 test('failed interrupt and detach leave a live target and pending command intact', options, async (t) => {
@@ -335,7 +370,7 @@ test('failed interrupt and detach leave a live target and pending command intact
       assert.ok(count(new Uint32Array(1), 1) > 0);
       assert.notEqual(kernel.func('int FreeConsole()')(), 0);
       await assert.rejects(session.interrupt(), Error);
-      assert.equal((await session.queryState()).ready_for_commands, false);
+      assert.equal((await session.queryState()).state, 'busy');
       await assert.rejects(session.detach(), Error);
       process.kill(pid, 0);
       assert.equal(session.exited, false);
@@ -371,9 +406,8 @@ test('dump commands remain cancellable without inferring target execution state'
   assert.equal(pending.completed, false);
   await delay(200);
   const state = await dump.queryState();
-  assert.equal(state.busy, true);
-  assert.equal(state.running, null);
-  assert.equal((await dump.interrupt()).ready_for_commands, true);
+  assert.equal(state.state, 'busy');
+  assert.equal((await dump.interrupt()).state, 'ready');
   const result = await dump.execute();
   assert.equal(result.completed, true);
   assert.match(result.output, /LOOP_STARTED/);
@@ -398,7 +432,7 @@ test('invalid redirected input leaves CDB and the previous command intact', opti
     assert.equal(collected.command_id, previous.command_id, command);
     assert.equal(collected.output, previous.output, command);
     assert.equal(collected.completed, true, command);
-    assert.equal((await session.queryState()).ready_for_commands, true, command);
+    assert.equal((await session.queryState()).state, 'ready', command);
     assert.equal(session.exited, false, command);
     process.kill(pid, 0);
     previous = await session.execute('.printf "POLICY_READY"');
@@ -424,7 +458,7 @@ test('quoted text, ordinary multiline loops, and noninteractive shells remain us
   const shell = await session.execute('.shell -i- cmd.exe /c echo NONINTERACTIVE_SHELL_WITNESS');
   assert.equal(shell.completed, true);
   assert.match(shell.output, /NONINTERACTIVE_SHELL_WITNESS/);
-  assert.equal(shell.state_after.ready_for_commands, true);
+  assert.equal(shell.state, 'ready');
   assert.equal(session.exited, false);
   assert.equal((await session.execute('.printf "AFTER_SHELL"')).output, 'AFTER_SHELL');
 });
@@ -461,7 +495,7 @@ test('CDB launch preserves TAB, empty, quote, and trailing-backslash arguments i
   assert.equal(witness.pid, pid);
   assert.deepEqual(witness.argv, argv);
   process.kill(pid, 0);
-  assert.equal((await session.interrupt()).ready_for_commands, true);
+  assert.equal((await session.interrupt()).state, 'ready');
   assert.equal((await session.execute()).completed, true);
   await session.close();
 });
@@ -542,8 +576,8 @@ test('a low output quota reports capture failure without blocking interruption, 
   assert.equal(Buffer.byteLength(failed.output, 'utf8'), failed.total_output_bytes);
   assert.equal(failed.has_more_output, false);
   assert.equal(session.exited, false);
-  assert.equal((await session.queryState()).ready_for_commands, false);
-  assert.equal((await session.interrupt()).ready_for_commands, true);
+  assert.equal((await session.queryState()).state, 'busy');
+  assert.equal((await session.interrupt()).state, 'ready');
   const interrupted = await session.execute(undefined, undefined, true, { command_id: started.command_id });
   assert.equal(interrupted.completed, true);
   assert.equal(interrupted.output_error, failed.output_error);
@@ -558,7 +592,7 @@ test('a low output quota reports capture failure without blocking interruption, 
   assert.equal(typeof finite.output_error, 'string');
   assert.ok(finite.total_output_bytes <= maxOutputBytes);
   assert.equal(Buffer.byteLength(finite.output, 'utf8'), finite.total_output_bytes);
-  assert.equal(finite.state_after.ready_for_commands, true);
+  assert.equal(finite.state, 'ready');
   assert.equal(session.exited, false);
   const final = await session.execute('.printf "AFTER_QUOTA_COMPLETION"');
   assert.equal(final.completed, true);

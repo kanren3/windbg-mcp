@@ -178,7 +178,7 @@ test("modern SDK default stdio buffer reconstructs more than 6 MiB without losin
   assert.equal(current.command_id, successor.command_id);
   const listed = payload(await client.callTool({ name: "windbg_sessions", arguments: {} }));
   assert.deepEqual(listed.sessions.map((session) => session.session_id), [session_id]);
-  assert.equal(listed.sessions[0].state.ready_for_commands, true);
+  assert.equal(listed.sessions[0].state, "ready");
   process.kill(ownedPid, 0);
   payload(await client.callTool({ name: "windbg_close", arguments: { session_id } }));
 });
@@ -207,16 +207,23 @@ test("native target termination keeps the debugger usable and direct quit releas
     name: "windbg_execute_command", arguments: { session_id, command: ".kill" },
   }));
   assert.equal(killed.completed, true);
+  assert.equal(killed.state, "ready");
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
   const usable = payload(await client.callTool({
     name: "windbg_execute_command", arguments: { session_id, command: '.printf "%d", 6*7' },
   }));
   assert.equal(usable.output, "42");
-  const quit = await client.callTool({
-    name: "windbg_execute_command", arguments: { session_id, command: "q" },
-  });
-  assert.equal(quit.isError, true);
+  const quit = payload(await client.callTool({
+    name: "windbg_execute_command", arguments: { session_id, command: '.printf "MCP_EXIT_WITNESS"\nq' },
+  }));
+  assert.equal(quit.state, "exited");
+  assert.equal(quit.completed, false);
+  assert.match(quit.output, /MCP_EXIT_WITNESS/);
   assert.deepEqual(payload(await client.callTool({ name: "windbg_sessions", arguments: {} })).sessions, []);
+  const expired = await client.callTool({
+    name: "windbg_execute_command", arguments: { session_id, command: "r" },
+  });
+  assert.equal(expired.isError, true);
 });
 
 test("explicit close terminates a session whose commands suppressed completion markers", {

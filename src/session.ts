@@ -14,25 +14,16 @@ function sleep(ms: number): Promise<void> {
 
 const MARKER_BASE = "COMMAND_COMPLETED_MARKER";
 const PROMPT_RE = /^\d+:\s*(?:\d+(?::\w+)?|kd)>\s*$/;
-const DEBUG_STATUS_BREAK = 6;
-const DEBUG_STATUS_NO_DEBUGGEE = 7;
 
-export interface DebuggerExecutionState {
-  raw_status: number | null;
-  status_name: string;
-  running: boolean | null;
-  busy: boolean;
-  ready_for_commands: boolean;
-  requires_interrupt_before_command: boolean;
-  summary: string;
+export interface SessionState {
+  state: "ready" | "busy" | "unavailable" | "closing" | "exited";
+  error?: string;
 }
 
-export interface CommandExecutionResult extends OutputPage {
+export interface CommandExecutionResult extends OutputPage, SessionState {
   command_id: string;
   command: string;
   completed: boolean;
-  state_before: DebuggerExecutionState;
-  state_after: DebuggerExecutionState;
   output_error?: string;
 }
 
@@ -44,10 +35,8 @@ export interface CommandOutputRequest {
 
 interface PendingCommand {
   command: string;
-  stateBefore: DebuggerExecutionState;
   output: CommandOutput;
   completed: boolean;
-  stateAfter: DebuggerExecutionState | null;
   outputError: Error | null;
   readers: number;
   retired: boolean;
@@ -92,7 +81,7 @@ export class DebuggerSession {
   private _cleanupError: Error | null = null;
   private _queue: Promise<void> | null = null;
   private _ending = false;
-  private _interruptPromise: Promise<DebuggerExecutionState> | null = null;
+  private _interruptPromise: Promise<SessionState> | null = null;
   private _interruptCommand: PendingCommand | null = null;
   private _lastCommand: PendingCommand | null = null;
 
@@ -176,27 +165,13 @@ export class DebuggerSession {
     return promise;
   }
 
-  async queryState(): Promise<DebuggerExecutionState> { return this.executionState(); }
+  async queryState(): Promise<SessionState> { return this.sessionState(); }
 
-  private executionState(): DebuggerExecutionState {
-    const alive = this.process.isAlive();
-    const ready = alive && !this._readError && !this._ending && !this._expectedMarker && this._atPrompt;
-    const status = !alive ? "no_debuggee" : this._readError ? "unknown"
-      : this._ending ? "closing" : this._expectedMarker ? "busy" : ready ? "break" : "unknown";
-    return {
-      raw_status: !alive ? DEBUG_STATUS_NO_DEBUGGEE : ready ? DEBUG_STATUS_BREAK : null,
-      status_name: status,
-      running: !alive || ready ? false : null,
-      busy: alive && !ready,
-      ready_for_commands: ready,
-      requires_interrupt_before_command: alive && !ready && !this._ending,
-      summary: !alive ? "Debugger process has exited. Open a new session."
-        : this._readError ? `Debugger I/O is unavailable: ${this._readError.message}`
-        : this._ending ? "The session is ending."
-        : ready ? "The debugger is at a command prompt."
-        : this._expectedMarker ? "A command is pending. Collect its output or interrupt it. A pending command does not identify the target's execution state."
-        : "Debugger readiness is unknown. Interrupt to establish a command prompt.",
-    };
+  private sessionState(): SessionState {
+    const state = !this.process.isAlive() ? "exited" : this._ending ? "closing"
+      : this._readError ? "unavailable" : this._expectedMarker ? "busy"
+      : this._atPrompt ? "ready" : "unavailable";
+    return { state, ...(this._readError ? { error: this._readError.message } : {}) };
   }
 
   execute(command?: string, timeout?: number, waitForCompletion = true, output: CommandOutputRequest = {}): Promise<CommandExecutionResult> {
@@ -218,15 +193,20 @@ export class DebuggerSession {
         if (this._readError) throw this._readError;
         if (waitForCompletion && !last.completed) await this.waitForReady(waitSeconds * 1000);
         if (this._readError) throw this._readError;
-        const page = await last.output.readPage(offset, maxBytes);
-        if (!last.completed && !this.process.isAlive()) throw new Error(`Debugger exited before command completion.\n${page.output}`);
+        let page = await last.output.readPage(offset, maxBytes);
+        const state = this.sessionState();
+        if (state.state === "exited" && !this._readerStopped) {
+          // Process exit can precede the reader draining its final stdout bytes.
+          while (!this._readerStopped) await (this._readTask ?? sleep(25));
+          if (this._readError) throw this._readError;
+          page = await last.output.readPage(offset, maxBytes);
+        }
         return {
           command_id: last.output.id,
           command: last.command,
           ...page,
           completed: last.completed,
-          state_before: last.stateBefore,
-          state_after: last.stateAfter ?? this.executionState(),
+          ...state,
           ...(last.outputError ? { output_error: last.outputError.message } : {}),
         };
       } finally {
@@ -250,8 +230,8 @@ export class DebuggerSession {
       if (this._ending) throw new Error("The session is ending");
       if (this._readError) throw this._readError;
       if (this._interruptPromise) await this._interruptPromise;
-      const stateBefore = this.executionState();
-      if (!stateBefore.ready_for_commands) throw new Error(`Debugger is not ready for a new command. ${stateBefore.summary}`);
+      const { state } = this.sessionState();
+      if (state !== "ready") throw new Error(`Debugger is not ready for a new command (state: ${state}).`);
       const previous = this._lastCommand;
       if (previous) {
         previous.retired = true;
@@ -260,8 +240,8 @@ export class DebuggerSession {
         this.retireOutput(this._capture);
       }
       const last: PendingCommand = {
-        command, stateBefore, output: this.newOutput(), completed: false,
-        stateAfter: null, outputError: null, readers: 0, retired: false,
+        command, output: this.newOutput(), completed: false,
+        outputError: null, readers: 0, retired: false,
       };
       this._lastCommand = last;
       this.beginCapture(last.output, last);
@@ -278,8 +258,8 @@ export class DebuggerSession {
     });
   }
 
-  interrupt(): Promise<DebuggerExecutionState> {
-    if (this.process.isAlive() && !this._readError && this._atPrompt && !this._expectedMarker) return Promise.resolve(this.executionState());
+  interrupt(): Promise<SessionState> {
+    if (this.process.isAlive() && !this._readError && this._atPrompt && !this._expectedMarker) return Promise.resolve(this.sessionState());
     const command = this._lastCommand;
     if (this._interruptPromise && this._interruptCommand === command) return this._interruptPromise;
     const previous = this._interruptPromise;
@@ -292,17 +272,17 @@ export class DebuggerSession {
     return result;
   }
 
-  private async interruptAndWait(): Promise<DebuggerExecutionState> {
+  private async interruptAndWait(): Promise<SessionState> {
     if (!this.process.isAlive()) throw new Error("Debugger process has exited");
     if (this._readError) throw this._readError;
-    if (this._atPrompt && !this._expectedMarker) return this.executionState();
+    if (this._atPrompt && !this._expectedMarker) return this.sessionState();
     await this.sendCtrlBreak();
     if (!this._expectedMarker && !this._atPrompt) {
       this._expectedMarker = this.nextMarker();
       await this.writeStdin(this.markerCommand(this._expectedMarker));
     }
     if (!await this.waitForReady(this.timeout * 1000)) throw new Error("Interrupt did not reach a command prompt. The session remains unavailable for new commands.");
-    return this.executionState();
+    return this.sessionState();
   }
 
   private async sendCtrlBreak(): Promise<void> {
@@ -512,10 +492,7 @@ export class DebuggerSession {
         parts = [];
         this._expectedMarker = null;
         this._atPrompt = true;
-        if (this._lastCommand) {
-          this._lastCommand.completed = true;
-          this._lastCommand.stateAfter = this.executionState();
-        }
+        if (this._lastCommand) this._lastCommand.completed = true;
         ready = true;
       } else if (!this._expectedMarker && !this._lineStarted && PROMPT_RE.test(line)) {
         this.observePrompt();
